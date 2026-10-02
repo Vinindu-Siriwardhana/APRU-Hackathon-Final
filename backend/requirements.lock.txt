@@ -1,0 +1,42 @@
+# The exact versions the test suite passed with (Python 3.11, 2026-10-01).
+# A fallback for the team's WINDOWS laptops (Python 3.11-3.13), if a newer release
+# inside requirements.txt's bounds misbehaves:
+#   .venv\Scripts\python -m pip install -r backend\requirements.lock.txt
+# Not for Python 3.10 (numpy 2.4 needs 3.11+), and not for older Macs / Linux
+# (opencv 5 and numpy 2.4 wheels need newer systems): use requirements.txt there.
+annotated-doc==0.0.5
+annotated-types==0.8.0
+anthropic==1.10.0
+anyio==4.15.1
+certifi==2026.7.22
+click==8.5.0
+docstring_parser==0.18.0
+et_xmlfile==2.0.0
+fastapi==0.142.2
+h11==0.16.0
+httpcore==1.0.9
+httpcore2==2.13.1
+httpx==0.28.1
+httpx2==2.13.1
+idna==3.20
+iniconfig==2.3.0
+jiter==0.17.0
+numpy==2.4.6
+opencv-python-headless==5.0.0.93
+openpyxl==3.1.5
+opentelemetry-api==1.45.0
+packaging==26.3
+pillow==12.3.0
+pluggy==1.6.0
+pydantic==2.13.5
+pydantic_core==2.46.5
+Pygments==2.21.0
+pytest==9.1.1
+python-multipart==0.0.32
+PyYAML==6.0.3
+sniffio==1.3.1
+starlette==1.7.0
+truststore==0.10.4
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+uvicorn==0.54.0

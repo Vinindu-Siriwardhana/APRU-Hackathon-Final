@@ -1,0 +1,15 @@
+# Bounded below the next major version, so a release on the morning of the demo can't
+# break the install, while Python 3.10-3.13 on Windows, macOS and Linux all still get
+# ready-made wheels (no compiler needed). Tested set: requirements.lock.txt.
+fastapi>=0.110,<1
+uvicorn>=0.29,<1
+python-multipart>=0.0.9,<1
+pydantic>=2.6,<3
+pyyaml>=6,<7
+openpyxl>=3.1,<4
+opencv-python-headless>=4.9,<6
+numpy>=1.26,<3
+pillow>=10,<13
+anthropic>=1.9,<2
+httpx>=0.27,<1
+pytest>=8,<10

@@ -1,0 +1,11 @@
+data/
+__pycache__/
+*.pyc
+.pytest_cache/
+samples/gn_workbook_demo.xlsx
+frontend/node_modules/
+.venv/
+
+# secrets and logs
+.env
+*.log

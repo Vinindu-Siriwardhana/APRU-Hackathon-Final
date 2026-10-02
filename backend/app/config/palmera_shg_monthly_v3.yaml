@@ -1,0 +1,181 @@
+# Palmera — "Monthly Report of the SHG to Cluster" (English V3, April 2026)
+# Everything the pipeline knows about this form lives here: layout, field types,
+# how weekly cells roll up into the monthly workbook, and the validation rules.
+# A new template (another partner, another region) = a new file like this one.
+
+template_id: palmera_shg_monthly_v3
+partner: Palmera
+languages: [en, si, ta]
+currency: LKR
+
+# ---------------------------------------------------------------------------
+# Page 1, top: header table (label cell + value cell pairs)
+# ---------------------------------------------------------------------------
+header_fields:
+  - key: shg_name
+    label: SHG Name
+    type: text
+    required: true
+  - key: total_members
+    label: Total Members
+    type: int
+    required: true
+    min: 0
+    max: 50                     # Mapping!E3
+  - key: village_gn
+    label: Village / GN
+    type: text
+    required: true
+  - key: month_year
+    label: Month/Year
+    type: month                 # normalised to YYYY-MM
+    required: true
+  - key: last_audit_date
+    label: Last financial audit date
+    type: date
+  - key: graded_last_3_months
+    label: Have you graded in the last 3 months and date
+    type: text                  # usually "Yes 12/03/2026" / "No"
+  - key: monthly_interest
+    label: Monthly interest
+    type: text                  # a rate, e.g. "2%"
+  - key: constitution_updated
+    label: Last month/year constitution was updated
+    type: text
+
+# ---------------------------------------------------------------------------
+# Page 1, main table: 28 rows x 7 columns (label, W1..W5, Total).
+# `row` = row index inside the table, header row = 0. Used for cell crops.
+# `weeks: false` = W1..W5 cells are shaded grey on the paper form.
+# `total: false` = Total cell is shaded grey.
+# ---------------------------------------------------------------------------
+weekly_table:
+  columns: [label, W1, W2, W3, W4, W5, Total]
+  rows:
+    # The Total cell of the yes/no row isn't read: members write a count there ("4") that
+    # isn't yes/no. The monthly count comes from the weeks (count_yes).
+    - {row: 1,  key: meeting_held,        label: "Was the SHG meeting held this week?",                type: yesno, total: false}
+    - {row: 2,  key: attendance,          label: "Number of people who attended (active)",             type: int}
+    - {row: 3,  key: inactive_members,    label: "Number of people who are inactive – waiting to pay loans off and then leave", type: int, weeks: false}
+    - {row: 4,  key: members_loans_overdue, label: "Number of people who have loans due and have not paid", type: int, weeks: false}
+    - {row: 5,  section: Financial Statement}
+    - {row: 6,  section: Income}
+    - {row: 7,  key: savings,             label: "Savings (Rs.)",                                       type: money}
+    - {row: 8,  key: savings_to_date,     label: "Total savings to date (Rs.)",                         type: money, kind: balance, total: false}
+    - {row: 9,  key: principal_repaid,    label: "Principal loan repayment (Rs.)",                      type: money}
+    - {row: 10, key: interest_repaid,     label: "Interest repayment (Rs.)",                            type: money}
+    - {row: 11, key: other_income,        label: "Other income (Membership fees, Other NGO funds, Fines, Social fund, Other) (Rs.)", type: money}
+    - {row: 12, section: Expenses}
+    - {row: 13, key: loans_distributed,   label: "Loans distributed (Rs.)",                             type: money}
+    - {row: 14, key: loan_purpose_income, label: "Loan Purpose – Income generation (Rs.)",              type: money}
+    - {row: 15, key: loan_purpose_emergency, label: "Loan Purpose – Emergency (Rs.)",                   type: money}
+    - {row: 16, key: loan_purpose_other,  label: "Loan Purpose – Other (Rs.)",                          type: money}
+    - {row: 17, key: savings_refunded,    label: "Savings refunded (Rs.)",                              type: money}
+    - {row: 18, key: loans_outstanding,   label: "Total Loans outstanding to date (Rs.)",               type: money, kind: balance}
+    - {row: 19, key: write_offs,          label: "Total write offs (members who have not paid)",        type: money}
+    - {row: 20, key: other_expenses,      label: "Other expenses (Interest refunded, Community / members support, CLA fee, Admin expenses & other) (Rs.)", type: money}
+    - {row: 21, section: Totals}
+    - {row: 22, key: total_income,        label: "Total Income (Rs.)",                                  type: money, kind: derived}
+    - {row: 23, key: total_loan,          label: "Total Loan (Rs.)",                                    type: money, kind: unclear}   # meaning to confirm with Palmera
+    - {row: 24, key: total_expenses,      label: "Total Expenses (Rs.)",                                type: money, kind: derived}
+    - {row: 25, key: expected_balance,    label: "Expected Balance (Rs.)",                              type: money, kind: balance}
+    - {row: 26, key: cash_in_hand,        label: "Actual Cash in Hand – End of the week (Rs.)",         type: money, kind: balance, total: false}
+    - {row: 27, key: cash_deposited_bank, label: "Amount of cash in hand deposited in SHG bank",         type: money, total: false}
+
+# ---------------------------------------------------------------------------
+# Page 2: free text + small tables
+# ---------------------------------------------------------------------------
+page2_fields:
+  - {key: high_cash_reason,  label: "If high cash in hand, provide reason", type: text}
+  - key: overdue_members
+    label: "Name of members whose loan are due and they haven't paid"
+    type: table
+    max_rows: 5
+    columns:
+      - {key: name, type: text}
+      - {key: amount_left, type: money}
+      - {key: months_overdue, type: int}
+      - {key: last_meeting_attended, type: text}
+  - {key: social_work,       label: "What social works did you do this month to support your members or the community", type: text}
+  - {key: members_with_goals, label: "How many women have current goals for the month written in their individual booklets?", type: int}
+  - {key: group_goal,        label: "Does your SHG have a group goal for this month and what is it?", type: text}
+  - {key: govt_ngo_support,  label: "In the past month, note any Government or NGO support / trainings given to your group", type: text}
+  - key: issues
+    label: "What issues are you facing ... and what further support can the cluster provide?"
+    type: table
+    max_rows: 2
+    columns:
+      - {key: issue, type: text}
+      - {key: support_from_cluster, type: text}
+  - {key: signed_by_completer,  label: "Name with signature (person completing the document)", type: text}
+  - {key: signed_by_cluster_rep, label: "Name with signature (Cluster SHG representative)", type: text}
+
+# ---------------------------------------------------------------------------
+# Weekly form -> monthly workbook (per-SHG tab of the GN Google Sheet).
+# Rows are found by their English label in column B — the same lookup Palmera's
+# own "SHG Monitoring" sheet uses — so inserting rows in the sheet can't break us.
+# `from`: how the monthly number is built from the weekly cells.
+#   count_yes  – number of weeks marked yes
+#   sum        – sum of W1..W5 (the handwritten Total is used as a cross-check)
+#   total      – the Total cell (for rows with shaded weeks)
+#   last_week  – value in the last ACTIVE week of the month (month-end balance). If that
+#                week's cell is blank the value is missing (validation blocks); an
+#                earlier week's balance is never used, it would be stale.
+#   header     – a header field
+# Rows NOT listed (Total Income, Total Expenses, Cash from app, all "to date"
+# rows) are formulas in the sheet and are never written.
+# ---------------------------------------------------------------------------
+workbook:
+  kind: palmera_gn_v1
+  label_column: B
+  month_row: 1                   # C1 = start month, D1.. = following months
+  first_month_column: C          # C holds opening balances ("before month 1")
+  monthly_rows:
+    - {label: "Total number of meetings held",   from: count_yes, field: meeting_held}
+    - {label: "Number of SHG members",           from: header,    field: total_members}
+    - {label: "Total attendance for the month",  from: sum,       field: attendance}
+    - {label: "Number of people who are inactive – waiting to pay loans off and then leave, or to leave for another reason", from: total, field: inactive_members}
+    - {label: "Savings (Rs.)",                   from: sum, field: savings}
+    - {label: "Principal loan repayments (Rs.)", from: sum, field: principal_repaid}
+    - {label: "Interest repayment (Rs.)",        from: sum, field: interest_repaid}
+    - {label: "Other income (Membership fees, Other NGO funds, Fines, Social fund, Other) (Rs.)", from: sum, field: other_income}
+    - {label: "Loans distributed (Rs.)",         from: sum, field: loans_distributed}
+    - {label: "Loan Purpose – Income generation (Rs.)", from: sum, field: loan_purpose_income}
+    - {label: "Loan Purpose – Emergency (Rs.)",  from: sum, field: loan_purpose_emergency}
+    - {label: "Loan Purpose – Other (Rs.)",      from: sum, field: loan_purpose_other}
+    - {label: "Savings refunded (Rs.)",          from: sum, field: savings_refunded}
+    - {label: "Other expenses (Interest refunded, Community / members support, CLA fee, Admin expenses & other) (Rs.)", from: sum, field: other_expenses}
+    - {label: "Loan right off (Rs.)",            from: sum, field: write_offs}
+    - {label: "Cash in Hand – at end of month (mother book) (Rs.)", from: last_week, field: cash_in_hand}
+  # Opening balances (column C) are only needed when an SHG tab is first created.
+  opening_rows:
+    - "Total savings to date (Rs.)"
+    - "Total Principal loan repayments to date (Rs.)"
+    - "Total Interest repayments to date (Rs.)"
+    - "Total Other income to date (Rs.)"
+    - "Total Loans distributed to date (Rs.)"
+    - "Total Savings refunded to date (Rs.)"
+    - "Total Other expenses to date (Rs.)"
+    - "Total Loan right off to date (Rs.)"
+    - "Total Loans outstanding to date (Rs.)"
+  # Captured by the form and referenced by the district workbook, but with no row
+  # in the current GN template. Stored in our database; written if the row exists.
+  optional_rows:
+    - {label: "Number of members who attended the last meeting", from: last_meeting, field: attendance}
+    - {label: "How many women have current goals for the month written in their individual booklets?", from: header, field: members_with_goals}
+
+# ---------------------------------------------------------------------------
+# Validation thresholds
+# ---------------------------------------------------------------------------
+validation:
+  money_tolerance: 1            # Rs. — rounding slack for arithmetic checks
+  max_money: 1000000            # Mapping!E6
+  max_interest: 100000          # Mapping!E8
+  max_other_expenses: 100000    # Mapping!E15
+  # Caps apply to every cell AND to the monthly figure written to the workbook.
+  high_cash_in_hand: 25000      # above this, the "reason" box should be filled (to confirm with Palmera)
+  # Palmera's GN sheet counts write-offs inside Total Expenses; the district
+  # report does not. Accept either on the handwritten form, report which one.
+  total_expenses_variants:
+    - [loans_distributed, savings_refunded, other_expenses]
+    - [loans_distributed, savings_refunded, other_expenses, write_offs]

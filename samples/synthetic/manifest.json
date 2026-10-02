@@ -1,0 +1,72 @@
+{
+ "kalaimagal_2026-10": {
+  "pages": [
+   "kalaimagal_2026-10_p1.jpg",
+   "kalaimagal_2026-10_p2.jpg"
+  ],
+  "truth": "kalaimagal_2026-10.truth.json"
+ },
+ "kalaimagal_2026-11": {
+  "pages": [
+   "kalaimagal_2026-11_p1.jpg",
+   "kalaimagal_2026-11_p2.jpg"
+  ],
+  "truth": "kalaimagal_2026-11.truth.json"
+ },
+ "sisila_2026-10": {
+  "pages": [
+   "sisila_2026-10_p1.jpg",
+   "sisila_2026-10_p2.jpg"
+  ],
+  "truth": "sisila_2026-10.truth.json"
+ },
+ "vasantham_2026-10": {
+  "pages": [
+   "vasantham_2026-10_p1.jpg",
+   "vasantham_2026-10_p2.jpg"
+  ],
+  "truth": "vasantham_2026-10.truth.json"
+ },
+ "bad_blurry": {
+  "pages": [
+   "bad_blurry_p1.jpg"
+  ],
+  "expect": "reject",
+  "problem": "blurry"
+ },
+ "bad_dark": {
+  "pages": [
+   "bad_dark_p1.jpg"
+  ],
+  "expect": "reject",
+  "problem": "too_dark"
+ },
+ "bad_shadow": {
+  "pages": [
+   "bad_shadow_p1.jpg"
+  ],
+  "expect": "reject",
+  "problem": "shadow"
+ },
+ "bad_cropped": {
+  "pages": [
+   "bad_cropped_p1.jpg"
+  ],
+  "expect": "reject",
+  "problem": "cut_off"
+ },
+ "bad_glare": {
+  "pages": [
+   "bad_glare_p1.jpg"
+  ],
+  "expect": "reject",
+  "problem": "glare"
+ },
+ "bad_steep_angle": {
+  "pages": [
+   "bad_steep_angle_p1.jpg"
+  ],
+  "expect": "reject",
+  "problem": "steep_angle"
+ }
+}
