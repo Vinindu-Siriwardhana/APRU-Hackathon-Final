@@ -9,3 +9,6 @@ frontend/node_modules/
 # secrets and logs
 .env
 *.log
+
+# local tunnel binary (keep out of git)
+cloudflared.exe
