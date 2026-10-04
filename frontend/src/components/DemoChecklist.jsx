@@ -13,7 +13,8 @@ export function demoSteps(subs, phone) {
   const best = sorted.find((s) => stage(s) >= 1) || sorted[0];
   const reached = (n) => subs.some((s) => stage(s) >= n);
   const fixed = subs.some((s) => (s.status === "needs_review" && !s.errors) || stage(s) >= 2);
-  const sentImage = phone.messages.some((m) => m.from !== "bot" && m.image) || subs.length > 0;
+  // ticked only once a photo passed the quality check and became a page of a report
+  const sentImage = subs.some((s) => (s.pages || []).length > 0);
   const saidOk = phone.messages.some((m) => m.from !== "bot" && /^\s*ok\b/i.test(m.text || "")) || reached(3);
   const report = (filter) => (best ? `#/inbox/${filter}/${best.id}` : `#/inbox/${filter}`);
   return [
@@ -26,7 +27,11 @@ export function demoSteps(subs, phone) {
   ];
 }
 
-export default function DemoChecklist({ steps, onClose }) {
+/**
+ * Floats at the bottom right, never over the photo or Start here. With a report or the
+ * Groups page open (`beside`) it shrinks to the current step only.
+ */
+export default function DemoChecklist({ steps, onClose, beside = false, inline = false }) {
   const ref = useRef(null);
   const done = steps.filter((s) => s.done).length;
   const current = steps.findIndex((s) => !s.done);
@@ -37,7 +42,7 @@ export default function DemoChecklist({ steps, onClose }) {
     return () => window.removeEventListener("keydown", esc);
   }, [onClose]);
   return (
-    <section className="checklist" aria-labelledby="checklist-h" tabIndex={-1} ref={ref}>
+    <section className={`checklist ${beside ? "is-compact" : ""} ${inline ? "is-inline" : ""}`} aria-labelledby="checklist-h" tabIndex={-1} ref={ref}>
       <header className="checklist-head">
         <div>
           <h2 id="checklist-h">Demo guide</h2>
@@ -48,7 +53,7 @@ export default function DemoChecklist({ steps, onClose }) {
       <div className="progress" aria-hidden><span style={{ width: `${(done / steps.length) * 100}%` }} /></div>
       <ol className="steps">
         {steps.map((s, i) => (
-          <li key={s.title} className={`step ${s.done ? "is-done" : ""} ${i === current ? "is-current" : ""}`}>
+          <li key={s.title} className={`step ${s.done ? "is-done" : ""} ${i === current ? "is-current" : ""} ${beside && i !== current ? "is-folded" : ""}`}>
             <span className="step-mark" aria-hidden>{s.done ? <Icon name="checkmark" size={12} stroke={3} /> : i + 1}</span>
             <div className="step-body">
               <span className="step-title">{s.title}<span className="sr-only">{s.done ? ", done" : ", to do"}</span></span>

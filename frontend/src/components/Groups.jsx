@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../api.js";
-import { monthName, money, moneyShort, pct } from "../format.js";
+import { monthName, money, moneyShort, officerError, pct } from "../format.js";
 import Icon from "./Icon.jsx";
 import LineChart from "./LineChart.jsx";
 
@@ -9,37 +9,56 @@ function explain(text) {
   if (/^Attendance \d+% of members/.test(text)) return "Fewer than six in ten members came to meetings. Members who stop coming often stop saving and repaying next. Call the group leader.";
   if (/^Attendance down/.test(text)) return "Fewer members are coming to meetings than a few months ago. It’s often the first sign of trouble. Worth a call to the group leader.";
   if (/Loan repayments fell/.test(text)) return "Members are paying back less each month. Page 2 of the latest report lists who is overdue; plan a visit.";
-  if (/Savings fell/.test(text)) return "The group is saving less each month. It can be a sign of money stress in the village.";
+  if (/Savings fell/.test(text)) return "The group is saving less each month. It can be a sign of money stress in the village. Ask the group leader at the next meeting, and watch next month’s figure.";
   if (/Mother-book cash differs/.test(text)) return "The cash the group counted doesn’t match what its own ledger says it should have. Usually a missed entry; check the mother book on the next visit.";
   if (/^No report since/.test(text)) return "This group hasn’t sent a report recently. Send a reminder on WhatsApp.";
   if (/No months recorded/.test(text)) return "Nothing is in the workbook for this group yet.";
   return null;
 }
 
-/** A compact financial-health read-out from the monthly series the workbook already holds. */
-function health(series) {
+/**
+ * A compact financial-health read-out from the monthly series the workbook already holds.
+ * Each tile's colour follows the early warnings below it (the same rules), so a tile is never
+ * green above a warning about the same measure. "Saved to date" is a running total: neutral.
+ */
+function health(series, flags = []) {
   const first = series[0], last = series[series.length - 1];
+  const flagFor = (re) => flags.find((f) => re.test(f.text));
+  const toneFor = (re, fallback) => {
+    const f = flagFor(re);
+    return f ? (f.level === "critical" ? "red" : "orange") : fallback;
+  };
   const out = [];
-  if (first && last && first.savings_to_date != null && last.savings_to_date != null && series.length > 1) {
-    const d = last.savings_to_date - first.savings_to_date;
-    out.push({ k: `Savings since ${monthName(first.month, true)}`, v: `${d >= 0 ? "+" : "−"}${money(Math.abs(d))}`,
-      note: first.savings_to_date ? `${d >= 0 ? "up" : "down"} ${Math.abs(Math.round((d / first.savings_to_date) * 100))}% to ${money(last.savings_to_date)}` : `now ${money(last.savings_to_date)}`,
-      tone: d > 0 ? "green" : d < 0 ? "red" : "grey" });
+  if (last?.savings_to_date != null) {
+    const d = first && series.length > 1 && first.savings_to_date != null ? last.savings_to_date - first.savings_to_date : null;
+    out.push({ k: "Saved to date", v: money(last.savings_to_date), wide: true,
+      note: d === null ? `by ${monthName(last.month, true)}` : `${d >= 0 ? "+" : "−"}${money(Math.abs(d))} since ${monthName(first.month, true)}`, tone: "neutral" });
   }
-  if (series.length > 1) {
-    const earlier = series.slice(0, -1).map((m) => m.principal);
+  const vsBefore = (key) => {
+    const earlier = series.slice(0, -1).map((m) => m[key]).filter((v) => v != null);
+    if (!earlier.length || last?.[key] == null) return null;
     const avg = earlier.reduce((a, b) => a + b, 0) / earlier.length;
-    const change = avg ? (last.principal - avg) / avg : 0;
-    out.push({ k: "Loan repayments", v: money(last.principal), note: Math.abs(change) < 0.05 ? "steady" : `${change > 0 ? "up" : "down"} ${Math.round(Math.abs(change) * 100)}% on the months before`, tone: change <= -0.1 ? "orange" : "green" });
+    return avg ? (last[key] - avg) / avg : 0;
+  };
+  const trend = (c) => (c === null ? "first month" : Math.abs(c) < 0.05 ? "steady on the months before" : `${c > 0 ? "up" : "down"} ${Math.round(Math.abs(c) * 100)}% on the months before`);
+  if (last?.savings != null) {
+    const c = vsBefore("savings");
+    out.push({ k: `Savings, ${monthName(last.month, true)}`, v: money(last.savings), note: trend(c), tone: toneFor(/^Savings/, c !== null && c <= -0.1 ? "orange" : "green") });
+  }
+  if (last?.principal != null) {
+    const c = vsBefore("principal");
+    out.push({ k: "Loan repayments", v: money(last.principal), note: trend(c), tone: toneFor(/repayments/i, c !== null && c <= -0.1 ? "orange" : "green") });
   }
   const rates = series.map((m) => m.attendance_rate).filter((r) => r != null);
   if (rates.length) {
     const avg = rates.reduce((a, b) => a + b, 0) / rates.length;
-    out.push({ k: "Attendance", v: pct(rates[rates.length - 1]), note: `${pct(avg)} on average`, tone: rates[rates.length - 1] < 0.6 ? "red" : rates[rates.length - 1] < avg - 0.1 ? "orange" : "green" });
+    const now = rates[rates.length - 1];
+    out.push({ k: "Attendance", v: pct(now), note: `${pct(avg)} on average`, tone: toneFor(/^Attendance/, now < 0.6 ? "red" : "green") });
   }
   if (last?.cash != null && last?.ledger_cash != null) {
     const gap = last.cash - last.ledger_cash;
-    out.push({ k: "Cash vs ledger", v: Math.abs(gap) <= 1 ? "Matches" : `${gap > 0 ? "+" : "−"}${money(Math.abs(gap))}`, note: `${money(last.cash)} counted, ${monthName(last.month, true)}`, tone: Math.abs(gap) <= 1 ? "green" : "red" });
+    out.push({ k: "Cash vs ledger", v: Math.abs(gap) <= 1 ? "Matches" : `${gap > 0 ? "+" : "−"}${money(Math.abs(gap))}`, note: `${money(last.cash)} counted, ${monthName(last.month, true)}`,
+      tone: toneFor(/cash/i, Math.abs(gap) <= 1 ? "green" : "red") });
   }
   return out;
 }
@@ -59,7 +78,7 @@ export default function Groups({ selected, subs }) {
           setGroups(g);
           setErr(null);
         })
-        .catch((e) => alive && setErr(e.message));
+        .catch((e) => alive && setErr(officerError(e.message)));
     load();
     const t = setInterval(() => !document.hidden && load(), 5000);
     return () => {
@@ -164,7 +183,7 @@ function GroupDetail({ g }) {
   }
   const last = s[s.length - 1];
   const months = s.map((m) => monthName(m.month, true));
-  const hl = health(s);
+  const hl = health(s, g.flags);
   return (
     <article className="detail">
       <header className="detail-head">
@@ -185,7 +204,7 @@ function GroupDetail({ g }) {
         <h2 className="group-title" id="health-h">Financial health</h2>
         <dl className="health">
           {hl.map((h) => (
-            <div key={h.k} className={`health-item tone-${h.tone}`}>
+            <div key={h.k} className={`health-item tone-${h.tone} ${h.wide ? "is-wide" : ""}`}>
               <dt>{h.k}</dt>
               <dd><span className="health-v">{h.v}</span><span className="health-note">{h.note}</span></dd>
             </div>

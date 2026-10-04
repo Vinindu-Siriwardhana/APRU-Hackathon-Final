@@ -7,7 +7,10 @@ import pytest
 from app.aggregate import to_monthly
 from app.sample_data import make_month
 from app.schema import load_template
+from app.validation import OPENING_LABELS
 from app.workbook import GNWorkbook, WorkbookError
+
+ZERO = {label: 0 for label in OPENING_LABELS}       # a group that started this month
 
 T = load_template()
 SRC = Path(__file__).parents[2] / "samples" / "gn_workbook_template.xlsx"
@@ -38,7 +41,7 @@ def test_monthly_rollup():
 def test_new_shg_first_month_creates_tab_and_opening_balances(wbpath):
     gn = GNWorkbook(wbpath, T)
     rep = gn.write_month("Kalaimagal", "2026-10", to_monthly(make_month(T), T),
-                         gn_name="Puthukkudiyiruppu East", create_tab=True)
+                         gn_name="Puthukkudiyiruppu East", create_tab=True, opening=ZERO)
     gn.save()
     assert rep.created_tab and rep.column == "C"
     assert "Number of members who attended the last meeting" in rep.skipped   # no such row yet
@@ -54,7 +57,7 @@ def test_new_shg_first_month_creates_tab_and_opening_balances(wbpath):
 
 def test_second_month_goes_to_next_column_and_prior_is_read(wbpath):
     gn = GNWorkbook(wbpath, T)
-    gn.write_month("Kalaimagal", "2026-10", to_monthly(make_month(T), T), gn_name="PTK East", create_tab=True)
+    gn.write_month("Kalaimagal", "2026-10", to_monthly(make_month(T), T), gn_name="PTK East", create_tab=True, opening=ZERO)
     nov = make_month(T, month="2026-11")
     rep = gn.write_month("kalaimagal ", "2026-11", to_monthly(nov, T))   # name matched loosely
     assert rep.column == "D" and not rep.created_tab
@@ -67,7 +70,7 @@ def test_second_month_goes_to_next_column_and_prior_is_read(wbpath):
 def test_refuses_silent_overwrite_and_formula_cells(wbpath):
     gn = GNWorkbook(wbpath, T)
     vals = to_monthly(make_month(T), T)
-    gn.write_month("Kalaimagal", "2026-10", vals, gn_name="PTK East", create_tab=True)
+    gn.write_month("Kalaimagal", "2026-10", vals, gn_name="PTK East", create_tab=True, opening=ZERO)
     changed = dict(vals, **{"Savings (Rs.)": 9999})
     with pytest.raises(WorkbookError, match="correction"):
         gn.write_month("Kalaimagal", "2026-10", changed)
@@ -79,6 +82,6 @@ def test_refuses_silent_overwrite_and_formula_cells(wbpath):
 
 def test_unknown_shg_suggests_close_names(wbpath):
     gn = GNWorkbook(wbpath, T)
-    gn.write_month("Kalaimagal", "2026-10", to_monthly(make_month(T), T), gn_name="PTK East", create_tab=True)
+    gn.write_month("Kalaimagal", "2026-10", to_monthly(make_month(T), T), gn_name="PTK East", create_tab=True, opening=ZERO)
     with pytest.raises(WorkbookError, match="Did you mean: Kalaimagal"):
         gn.write_month("Kalaimagel", "2026-11", {})

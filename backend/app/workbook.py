@@ -316,16 +316,28 @@ class GNWorkbook:
                 d.value = _translated(s.value, s.coordinate, d.coordinate, dst - src_row)
                 if s.has_style:
                     d._style = copy(s._style)
-            mon.cell(dst, 1).value = gn
-            mon.cell(dst, 2).value = shg
+            _set_text(mon.cell(dst, 1), gn)
+            _set_text(mon.cell(dst, 2), shg)
 
     def write_month(self, shg_name: str, month: str, values: dict[str, Any], *,
                     gn_name: Optional[str] = None, overwrite: bool = False, create_tab: bool = False,
-                    opening: Optional[dict[str, Any]] = None, correction: bool = False) -> WriteReport:
+                    opening: Optional[dict[str, Any]] = None, to_date: Optional[dict[str, Any]] = None,
+                    correction: bool = False) -> WriteReport:
         """Write one month's figures. overwrite=True (alias: correction) replaces values
         already there: only after an officer confirmed a correction. create_tab=True creates
-        a tab for an unknown name: only after an officer confirmed it is a new group."""
+        a tab for an unknown name: only after an officer confirmed it is a new group.
+
+        Column C (a tab's first month) also holds the nine "to date" totals. They are written
+        only when given: `opening` = the totals BEFORE this month (from the mother book, or
+        zeros for a group that started this month; this month's flows are added), or `to_date`
+        = the column-C values themselves (already including this month). A new tab needs one
+        of them. overwrite=True alone never touches existing totals: correcting month 1's
+        flows must not wipe the group's lifetime figures."""
         overwrite = overwrite or correction
+        if opening is not None and to_date is not None:
+            raise WorkbookError("Give either the opening totals or the to-date totals, not both.")
+        if opening is not None or to_date is not None:
+            self._check_totals(to_date if to_date is not None else opening)   # before anything changes
         sheet, candidates = self.find_shg(shg_name)
         created = False
         if sheet is None:
@@ -335,6 +347,9 @@ class GNWorkbook:
                 raise WorkbookError(f"No tab for SHG '{shg_name}' — confirm it as a new group first.")
             if not gn_name:
                 raise WorkbookError(f"No tab for SHG '{shg_name}', and no Village / GN to register it under.")
+            if opening is None and to_date is None:
+                raise WorkbookError(f"New group '{shg_name}': its opening 'to date' totals are needed (from the "
+                                    "mother book, or zero if the group started this month), so nothing was written.")
             sheet = self.create_shg_tab(shg_name, gn_name, month).title
             created = True
         ws = self.wb[sheet]
@@ -344,9 +359,12 @@ class GNWorkbook:
         rep = WriteReport(sheet=sheet, month=month, column=letter, created_tab=created)
 
         todo = dict(values)
-        if col == FIRST_COL:
-            # month 1: column C also carries the opening "to date" totals as plain inputs
-            todo.update(self._opening_values(values, opening, rep))
+        if (opening is not None or to_date is not None) and col != FIRST_COL:
+            raise WorkbookError(f"Opening totals go in a tab's first month (column C), but {month} is "
+                                f"column {letter} of '{sheet}'. Nothing was written.")
+        if col == FIRST_COL and (opening is not None or to_date is not None):
+            # month 1: column C also carries the "to date" totals as plain inputs
+            todo.update(self._opening_values(values, opening, to_date))
         optional = {_norm(r["label"]) for r in self.t.workbook.get("optional_rows", [])}
 
         # check first, then write — never a half-written month
@@ -374,25 +392,40 @@ class GNWorkbook:
         if missing:
             raise WorkbookError(f"Tab '{sheet}' has no row labelled {', '.join(repr(m) for m in missing)} "
                                 "(column B). The workbook layout has changed, so nothing was written.")
+        opening_labels = {_norm(l) for l in self.t.workbook.get("opening_rows", [])}
         for row, label, new in planned:
             cell = ws.cell(row, col)
+            if (col == FIRST_COL and not created and cell.value not in (None, "") and cell.value != new
+                    and _norm(label) not in opening_labels and not any("lifetime" in w for w in rep.warnings)
+                    and opening is None and to_date is None):
+                rep.warnings.append(f"{sheet}!{letter} is the tab's first month, so its rows 'Total … to date' hold "
+                                    "the group's lifetime totals including this month. They were not changed: if "
+                                    "this correction changes them, update them from the mother book.")
             rep.writes.append(CellWrite(label=label, cell=f"{sheet}!{cell.coordinate}", old=cell.value, new=new))
             cell.value = new
         self._written = sheet
         return rep
 
+    def _check_totals(self, given: Any) -> list[str]:
+        labels = list(self.t.workbook.get("opening_rows", []))
+        if not isinstance(given, dict):
+            raise WorkbookError("The opening totals must be a set of figures. Nothing was written.")
+        bad = [l for l in labels if not _is_number(given.get(l)) or given.get(l) < 0]
+        if bad:
+            raise WorkbookError("Opening totals missing, negative or not a number: "
+                                + ", ".join(repr(b) for b in bad) + ". Nothing was written.")
+        return labels
+
     def _opening_values(self, values: dict[str, Any], opening: Optional[dict[str, Any]],
-                        rep: WriteReport) -> dict[str, Any]:
-        """To-date totals for column C. Given explicitly (from the group's mother book) or,
-        for a group whose records start this month, equal to this month's flows."""
-        if opening:
-            return dict(opening)
+                        to_date: Optional[dict[str, Any]]) -> dict[str, Any]:
+        """Column C's nine "to date" totals: `to_date` as given, or `opening` (before the month)
+        plus this month's flows, so Palmera's C20 'cash from app' equals the month-end cash."""
+        given = to_date if to_date is not None else opening
+        labels = self._check_totals(given)
+        if to_date is not None:
+            return {l: given[l] for l in labels}
         g = lambda k: values.get(k) or 0
-        rep.warnings.append("New SHG tab: opening 'to date' totals were set to this month's figures. "
-                            "That is only right for a group that started this month — otherwise Palmera's "
-                            "'cash from app' will be off by the cash the group already held. Enter the "
-                            "lifetime totals from the mother book.")
-        return {
+        flows = {
             "Total savings to date (Rs.)": g("Savings (Rs.)"),
             "Total Principal loan repayments to date (Rs.)": g("Principal loan repayments (Rs.)"),
             "Total Interest repayments to date (Rs.)": g("Interest repayment (Rs.)"),
@@ -403,6 +436,7 @@ class GNWorkbook:
             "Total Loan right off to date (Rs.)": g("Loan right off (Rs.)"),
             "Total Loans outstanding to date (Rs.)": g("Loans distributed (Rs.)") - g("Principal loan repayments (Rs.)") - g("Loan right off (Rs.)"),
         }
+        return {l: _tidy(given[l] + flows[l]) for l in labels}
 
     def _activate(self, sheet: str) -> None:
         """Open the workbook on the tab just written (and only that tab selected: two
@@ -433,6 +467,29 @@ class GNWorkbook:
             if os.path.exists(tmp):
                 os.unlink(tmp)
         return out
+
+
+def _is_number(v: Any) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and v == v and abs(v) != float("inf")
+
+
+def _tidy(n: float) -> int | float:
+    return int(n) if float(n).is_integer() else round(float(n), 2)
+
+
+_FORMULA_START = ("=", "+", "-", "@")
+
+
+def _set_text(cell: Any, text: Any) -> None:
+    """Store a name as plain text, never as a formula: Google Sheets and Excel run a cell
+    starting with = + - @ (IMPORTXML, HYPERLINK, DDE…). Such text is kept as a string cell with
+    Excel's quote prefix (what typing a leading apostrophe does), so it shows exactly as written."""
+    if isinstance(text, str) and text.lstrip(" \t\r\n").startswith(_FORMULA_START):
+        cell.value = text
+        cell.data_type = "s"            # openpyxl took it for a formula
+        cell.quotePrefix = True
+    else:
+        cell.value = text
 
 
 def _translated(v: Any, origin: str, dest: str, row_shift: int) -> Any:

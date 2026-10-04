@@ -11,11 +11,15 @@ from app import workbook as W  # noqa: E402
 
 def seed(out: Path) -> Path:
     """The demo workbook. Seeding creates the demo groups' tabs, which write_month only
-    does when asked (create_tab=True); this works whether or not seed() asks for it."""
+    does when asked (create_tab=True); this works whether or not seed() asks for it.
+    The seed's June totals are column-C (end of June) values: written verbatim (`to_date=`),
+    whether the seed passes them as `to_date=` or as the older `opening=`."""
     orig = W.GNWorkbook.write_month
 
     def write_month(self, *a, **kw):
         kw.setdefault("create_tab", True)
+        if "opening" in kw and "to_date" not in kw:
+            kw["to_date"] = kw.pop("opening")
         return orig(self, *a, **kw)
 
     W.GNWorkbook.write_month = write_month

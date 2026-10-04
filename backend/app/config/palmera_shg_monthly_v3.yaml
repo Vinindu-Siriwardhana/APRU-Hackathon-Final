@@ -129,7 +129,7 @@ workbook:
   kind: palmera_gn_v1
   label_column: B
   month_row: 1                   # C1 = start month, D1.. = following months
-  first_month_column: C          # C holds opening balances ("before month 1")
+  first_month_column: C          # C = month 1; its "to date" rows also hold the lifetime totals (incl. month 1)
   monthly_rows:
     - {label: "Total number of meetings held",   from: count_yes, field: meeting_held}
     - {label: "Number of SHG members",           from: header,    field: total_members}
@@ -147,7 +147,10 @@ workbook:
     - {label: "Other expenses (Interest refunded, Community / members support, CLA fee, Admin expenses & other) (Rs.)", from: sum, field: other_expenses}
     - {label: "Loan right off (Rs.)",            from: sum, field: write_offs}
     - {label: "Cash in Hand – at end of month (mother book) (Rs.)", from: last_week, field: cash_in_hand}
-  # Opening balances (column C) are only needed when an SHG tab is first created.
+  # The nine "to date" totals typed into column C (formulas from D on). Written only for a
+  # new tab (or an explicit opening): the group's totals BEFORE month 1 from its mother book
+  # (zeros if it started that month) plus month 1's flows, so Palmera's C20 'cash from app'
+  # equals the month-end cash. Correcting month 1 later never rewrites them.
   opening_rows:
     - "Total savings to date (Rs.)"
     - "Total Principal loan repayments to date (Rs.)"

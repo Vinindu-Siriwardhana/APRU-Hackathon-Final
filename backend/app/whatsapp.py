@@ -8,7 +8,9 @@ Setup (Meta developer account -> app -> WhatsApp product):
   WHATSAPP_APP_SECRET    the Meta app secret. When set, every webhook POST must carry a
                          valid X-Hub-Signature-256 header; unsigned or forged posts get 401.
                          Always set it in production: without it anyone who finds the URL
-                         could post "OK" on a member's behalf.
+                         could post "OK" on a member's behalf. With WHATSAPP_TOKEN set and
+                         no app secret, the webhook REFUSES every post (503) unless
+  WHATSAPP_ALLOW_UNSIGNED=1  is set (local testing only).
   WHATSAPP_API_VERSION   Graph API version, e.g. v21.0 (check Meta's docs for the current one)
 Test numbers can only message phones added to the app's recipient list.
 """
@@ -61,16 +63,37 @@ def signature_required() -> bool:
     return bool(os.environ.get("WHATSAPP_APP_SECRET"))
 
 
+def allow_unsigned() -> bool:
+    return os.environ.get("WHATSAPP_ALLOW_UNSIGNED") == "1"
+
+
+UNSIGNED_REFUSED = ("WhatsApp is configured (WHATSAPP_TOKEN) but WHATSAPP_APP_SECRET is not set, so incoming "
+                    "messages can't be checked and the webhook refuses them. Set WHATSAPP_APP_SECRET "
+                    "(or WHATSAPP_ALLOW_UNSIGNED=1 for local testing only).")
+
+
+def webhook_state() -> str:
+    """'signed': every post must be signed by Meta. 'refused': WhatsApp can send but posts
+    can't be checked, so they are refused. 'unsigned': posts are accepted unchecked (local
+    testing: no token, or WHATSAPP_ALLOW_UNSIGNED=1)."""
+    if signature_required():
+        return "signed"
+    if configured() and not allow_unsigned():
+        return "refused"
+    return "unsigned"
+
+
 def signature_ok(body: bytes, header: Optional[str]) -> bool:
     """X-Hub-Signature-256 = 'sha256=' + HMAC-SHA256(app secret, raw body). True when no
-    secret is configured (local testing only)."""
+    secret is configured (local testing only; see webhook_state). Never raises: a header with
+    non-ASCII characters is simply wrong."""
     secret = os.environ.get("WHATSAPP_APP_SECRET")
     if not secret:
         return True
-    if not header or not header.startswith("sha256="):
+    if not header or not header.isascii() or not header.startswith("sha256="):
         return False
     expected = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
-    return hmac.compare_digest(expected, header[len("sha256="):].strip().lower())
+    return hmac.compare_digest(expected.encode(), header[len("sha256="):].strip().lower().encode())
 
 
 def _list(x: Any) -> list:
@@ -93,6 +116,68 @@ def parse_incoming(payload: Any) -> list[dict[str, Any]]:
                 if m is not None:
                     out.append(m)
     return out
+
+
+def parse_statuses(payload: Any) -> list[dict[str, Any]]:
+    """Delivery callbacks for messages WE sent: [{wamid, recipient, status, error}].
+    Meta reports a send it accepted but could not deliver (e.g. outside the 24-hour window)
+    only here, as status 'failed' with an errors[] list. Never raises."""
+    out: list[dict[str, Any]] = []
+    for entry in _list(_dict(payload).get("entry")):
+        for change in _list(_dict(entry).get("changes")):
+            for st in _list(_dict(_dict(change).get("value")).get("statuses")):
+                st = _dict(st)
+                wamid, to, status = st.get("id"), st.get("recipient_id"), st.get("status")
+                if not (isinstance(wamid, str) and isinstance(to, str) and isinstance(status, str)):
+                    continue
+                err = _dict(next(iter(_list(st.get("errors"))), {}))
+                out.append({"wamid": wamid[:200], "recipient": to.strip()[:32], "status": status[:20],
+                            "error": describe_error(err.get("code"), err.get("title") or err.get("message"))
+                            if status == "failed" else None})
+    return out
+
+
+def describe_error(code: Any, text: Any = None) -> str:
+    """A WhatsApp error in words an officer can act on."""
+    try:
+        code = int(code)
+    except (TypeError, ValueError):
+        code = None
+    if code == 131047:
+        return ("Not delivered: more than 24 hours have passed since her last message, so WhatsApp only allows "
+                "an approved template message. Ask her to send any message, then use Resend.")
+    if code in (131026, 131030):
+        return ("Not delivered: WhatsApp can't reach this number (it may not use WhatsApp, or it isn't on the "
+                "test number's recipient list).")
+    if code in (190, 0) or code == 401:
+        return "Not delivered: the WhatsApp access token is wrong or has expired. Renew WHATSAPP_TOKEN, then use Resend."
+    detail = f" ({str(text)[:200]})" if text else ""
+    return f"Not delivered: WhatsApp refused the message{detail}. Use Resend to try again."
+
+
+def describe_send_error(e: Exception) -> str:
+    """Why send_text failed, for the officer."""
+    resp = getattr(e, "response", None)
+    if resp is not None:
+        try:
+            err = _dict(_dict(resp.json()).get("error"))
+        except ValueError:
+            err = {}
+        if err:
+            return describe_error(err.get("code"), err.get("message"))
+        if resp.status_code == 401:
+            return describe_error(401)
+        return describe_error(None, f"HTTP {resp.status_code}")
+    if isinstance(e, RuntimeError) and "is not set" in str(e):
+        return f"Not sent: WhatsApp isn't set up on this server ({e})."
+    return f"Not delivered: WhatsApp could not be reached ({type(e).__name__}). Use Resend to try again."
+
+
+def sent_id(result: Any) -> Optional[str]:
+    """The WhatsApp message id ('wamid…') Meta gave a message we sent."""
+    msgs = _list(_dict(result).get("messages"))
+    mid = _dict(msgs[0]).get("id") if msgs else None
+    return mid if isinstance(mid, str) else None
 
 
 def _parse_message(msg: dict) -> Optional[dict[str, Any]]:

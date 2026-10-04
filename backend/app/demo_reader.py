@@ -27,9 +27,19 @@ DEMO_ERRORS = {
 }
 
 
+UNKNOWN_PHOTO = ("This photo isn't one of the demo samples, so offline demo mode can't read it. "
+                 "Ask the member for a new photo.")
+
+
 class UnknownSamplePhoto(Exception):
-    """Offline demo mode was given a photo that isn't one of the samples."""
+    """Offline demo mode was given a photo that isn't one of the samples. The message is
+    for the officer (shown on the failed report); `member_key` is what the member gets."""
     member_key = "demo_unknown_photo"          # which bot message the member gets
+    kind = "unknown_sample"                     # Try again can't help: the dashboard offers a new photo
+
+    def __init__(self, message: str = UNKNOWN_PHOTO, kind: str = "unknown_sample"):
+        super().__init__(message)
+        self.kind = kind
 
 
 class SampleIndex:
@@ -71,18 +81,19 @@ class DemoReader:
         Stateless, so two reports being read at the same time can't mix."""
         cases = {self.samples.case_of.get(sub.page_sources.get(p) or "") for p in sub.pages}
         if not cases or None in cases:
-            raise UnknownSamplePhoto("Offline demo mode only reads the sample photos, and this photo isn't one "
-                                     "of them. Set ANTHROPIC_API_KEY to read real forms.")
+            raise UnknownSamplePhoto()
         if len(cases) > 1:
-            raise UnknownSamplePhoto(f"The pages come from different sample reports ({', '.join(sorted(cases))}).")
+            raise UnknownSamplePhoto("Page 1 and page 2 come from two different demo samples, so offline demo "
+                                     "mode can't read them as one report. Ask the member for new photos of "
+                                     "both pages.", kind="mixed_samples")
         case = cases.pop()
         truth = self.truth(case)
         if truth is None:
-            raise UnknownSamplePhoto(f"The sample '{case}' has no ground truth to read from.")
+            raise UnknownSamplePhoto("This demo sample has no answer sheet, so offline demo mode can't read it. "
+                                     "Ask the member for a new photo.")
         return SimulatedReader(self.t, truth, self.errors.get(case))
 
     def read(self, images, prompt, schema):
         if self.current is None:
-            raise UnknownSamplePhoto("Offline demo mode only reads the sample photos. "
-                                     "Set ANTHROPIC_API_KEY to read real forms.")
+            raise UnknownSamplePhoto()
         return self.current.read(images, prompt, schema)

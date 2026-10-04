@@ -53,9 +53,19 @@ export default function PhotoViewer({ pages, page, onPage, src, box, label, onCl
     <div className="viewer">
       <div className="viewer-bar">
         {pages.length > 1 ? (
-          <div className="segmented" role="tablist" aria-label="Page of the form">
+          <div className="segmented" role="tablist" aria-label="Page of the form"
+            onKeyDown={(e) => {
+              const i = pages.indexOf(page);
+              const n = e.key === "ArrowRight" ? i + 1 : e.key === "ArrowLeft" ? i - 1 : e.key === "Home" ? 0 : e.key === "End" ? pages.length - 1 : null;
+              if (n === null) return;
+              e.preventDefault();
+              const p = pages[(n + pages.length) % pages.length];
+              onPage(p);
+              e.currentTarget.querySelector(`[data-page="${p}"]`)?.focus();
+            }}>
             {pages.map((p) => (
-              <button key={p} role="tab" aria-selected={page === p} className={page === p ? "is-on" : ""} onClick={() => onPage(p)}>
+              <button key={p} role="tab" data-page={p} id={`page-tab-${p}`} aria-selected={page === p} aria-controls="page-panel" tabIndex={page === p ? 0 : -1}
+                className={page === p ? "is-on" : ""} onClick={() => onPage(p)}>
                 Page {p}
               </button>
             ))}
@@ -69,7 +79,7 @@ export default function PhotoViewer({ pages, page, onPage, src, box, label, onCl
           </button>
         )}
       </div>
-      <div className="viewer-frame" ref={frame}>
+      <div className="viewer-frame" ref={frame} id="page-panel" role={pages.length > 1 ? "tabpanel" : undefined} aria-labelledby={pages.length > 1 ? `page-tab-${page}` : undefined}>
         {pages.includes(page) ? (
           <>
             <div

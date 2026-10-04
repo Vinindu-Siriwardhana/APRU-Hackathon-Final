@@ -19,14 +19,15 @@ from seed_demo_workbook import seed as _seed  # noqa: E402
 from app import workbook as W
 from app.aggregate import last_active_week, to_monthly
 from app.extraction import ClaudeReader, ExtractionError, PageReadings, extract, merge, page1_schema
-from app.models import FieldValue, FormRecord, Legibility, PriorMonth, normalise
+from app.models import FieldStatus, FieldValue, FormRecord, Legibility, PriorMonth, normalise
 from app.sample_data import make_month
 from app.schema import load_template
-from app.validation import Validator
+from app.validation import OPENING_LABELS, Validator
 from app.workbook import GNWorkbook, WorkbookError
 
 T = load_template()
 V = Validator(T)
+ZERO = {label: 0 for label in OPENING_LABELS}
 SYN = ROOT / "samples" / "synthetic"
 CASH = "Cash in Hand – at end of month (mother book) (Rs.)"
 TEMPLATE_XLSX = ROOT / "samples" / "gn_workbook_template.xlsx"
@@ -39,6 +40,8 @@ def seed(path):
 
     def write_month(self, *a, **kw):
         kw.setdefault("create_tab", True)
+        if "opening" in kw and kw["opening"] and kw["opening"].get("Total savings to date (Rs.)"):
+            kw["to_date"] = kw.pop("opening")   # round-1 seed: its June totals are column-C values
         return orig(self, *a, **kw)
     with mock.patch.object(W.GNWorkbook, "write_month", write_month):
         return _seed(path)
@@ -188,8 +191,13 @@ def test_expense_definition_per_week():
 
 
 def test_month_gap_does_not_use_older_cash_as_last_month():
-    res = V.validate(record(month()), PriorMonth(month="2026-08", cash_in_hand=10400, members=15))
+    rec = record(month())
+    res = V.validate(rec, PriorMonth(month="2026-08", cash_in_hand=10400, members=15))
     assert "expected_balance" not in rules(res)
+    assert "month_unexpected" in [i.rule for i in res.errors]       # round 2: blocks until checked
+    rec.fields["header.month_year"].status = FieldStatus.officer_confirmed
+    res = V.validate(rec, PriorMonth(month="2026-08", cash_in_hand=10400, members=15))
+    assert "expected_balance" not in rules(res) and not res.errors
     gap = [i for i in res.issues if i.rule == "month_gap"]
     assert gap and gap[0].severity.value == "warning"
     assert gap[0].message.startswith("The last month recorded is August 2026, so September 2026 is missing.")
@@ -403,7 +411,7 @@ def test_unknown_group_needs_explicit_new_group(tmp_path):
     with pytest.raises(WorkbookError, match="confirm it as a new group first"):
         wb.write_month("கலைமகள்", "2026-10", to_monthly(make_month(T), T), gn_name="X")
     assert wb.write_month("கலைமகள்", "2026-10", to_monthly(make_month(T), T), gn_name="X",
-                          create_tab=True).created_tab
+                          create_tab=True, opening=ZERO).created_tab
 
 
 def test_month_recorded_and_prior_in_first_column(wbpath):
@@ -483,10 +491,10 @@ def test_long_and_odd_group_names(tmp_path):
     g = GNWorkbook(p, T)
     vals = to_monthly(make_month(T), T)
     long = "Kalaimagal Women's Development Society"
-    g.write_month(long, "2026-10", vals, gn_name="X", create_tab=True)
+    g.write_month(long, "2026-10", vals, gn_name="X", create_tab=True, opening=ZERO)
     rep = g.write_month(long, "2026-11", vals)                  # found again despite the 31-char cut
     assert rep.column == "D" and not rep.created_tab and len(rep.sheet) <= 31 and "'" not in rep.sheet
-    rep = g.write_month("Ruhunu/Pola 2", "2026-10", vals, gn_name="X", create_tab=True)
+    rep = g.write_month("Ruhunu/Pola 2", "2026-10", vals, gn_name="X", create_tab=True, opening=ZERO)
     assert rep.sheet == "Ruhunu-Pola 2"
     g.save()
 
@@ -495,7 +503,7 @@ def test_year_rollover_column(tmp_path):
     p = tmp_path / "gn.xlsx"; shutil.copy(TEMPLATE_XLSX, p)
     g = GNWorkbook(p, T)
     vals = to_monthly(make_month(T), T)
-    assert g.write_month("Kalaimagal", "2026-11", vals, gn_name="X", create_tab=True).column == "C"
+    assert g.write_month("Kalaimagal", "2026-11", vals, gn_name="X", create_tab=True, opening=ZERO).column == "C"
     g.write_month("Kalaimagal", "2026-12", vals)
     rep = g.write_month("Kalaimagal", "2027-01", vals)
     assert rep.column == "E"

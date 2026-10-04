@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { api } from "../../api.js";
-import { fieldName, money, shortMonthly } from "../../format.js";
+import { curly, fieldName, money, shortMonthly } from "../../format.js";
 import Icon from "../Icon.jsx";
 import { CHECKED, issueKey } from "./ranking.js";
 
@@ -27,7 +27,7 @@ function useLeaving(items, ms = 900) {
   return out;
 }
 
-export default function IssueList({ sid, sub, errors, notes, order, selected, onSelect, act, showW5 }) {
+export default function IssueList({ sid, sub, errors, notes, order, selected, onSelect, act, showW5, onNewGroup }) {
   const rows = useLeaving(errors);
   const fields = sub.record?.fields || {};
   const review = sub.status === "needs_review";
@@ -42,8 +42,8 @@ export default function IssueList({ sid, sub, errors, notes, order, selected, on
             {rows.map(({ item: i, leaving }) => {
               const k = issueKey(i) + (leaving ? "-x" : "");
               if (i.rule === "member_correction") return <MemberCorrection key={k} issue={i} sub={sub} sid={sid} act={act} leaving={leaving} {...common} />;
-              if (i.rule === "unknown_shg") return <UnknownGroup key={k} issue={i} sid={sid} act={act} leaving={leaving} editable={review} {...common} />;
-              return <IssueRow key={k} issue={i} leaving={leaving} {...common} />;
+              if (i.rule === "unknown_shg") return <UnknownGroup key={k} issue={i} sid={sid} act={act} leaving={leaving} editable={review} onNewGroup={onNewGroup} {...common} />;
+              return <IssueRow key={k} issue={i} leaving={leaving} editable={review} onNewGroup={onNewGroup} {...common} />;
             })}
           </ul>
         </>
@@ -73,7 +73,7 @@ function Chips({ issue, fields, labels, selected, onSelect, order, quiet, showW5
       {targets.slice(0, max).map((f) => {
         const done = CHECKED.includes(fields[f]?.status);
         return (
-          <button key={f} className={`chip ${f === selected ? "is-selected" : ""} ${done ? "is-done" : ""} ${f === top ? "is-likely" : ""}`}
+          <button key={f} data-fid={f} className={`chip ${f === selected ? "is-selected" : ""} ${done ? "is-done" : ""} ${f === top ? "is-likely" : ""}`}
             onClick={() => onSelect(f, { scroll: true })} aria-pressed={f === selected}
             title={done ? "Already checked against the photo" : f === top ? "Appears in the most failing checks" : "Show on the photo"}>
             {done && <Icon name="checkmark" size={12} stroke={2.4} />}
@@ -87,16 +87,36 @@ function Chips({ issue, fields, labels, selected, onSelect, order, quiet, showW5
   );
 }
 
-function IssueRow({ issue, quiet, leaving, selected, ...rest }) {
+/** Continuity checks the officer settles against the photo: open the cell, then Keep confirms it as written. */
+const CONFIRMABLE = { month_unexpected: "header.month_year", members_jump: "header.total_members" };
+
+function IssueRow({ issue, quiet, leaving, selected, editable, onNewGroup, ...rest }) {
   const active = (issue.fields || []).includes(selected);
+  const confirmField = !quiet && editable && CONFIRMABLE[issue.rule] && rest.fields[CONFIRMABLE[issue.rule]] ? CONFIRMABLE[issue.rule] : null;
+  const opening = !quiet && editable && issue.rule === "opening_inconsistent" && onNewGroup;
   return (
     <li className={`issue ${quiet ? "is-quiet" : ""} ${active && !leaving ? "is-selected" : ""} ${leaving ? "is-leaving" : ""}`} aria-hidden={leaving || undefined}>
       <div className="issue-inner">
         <Icon name={leaving ? "checkmark" : quiet ? "info" : "warn"} size={16} stroke={leaving ? 2.4 : 1.7}
           className={leaving ? "tone-text-green" : quiet ? "tone-text-grey" : "tone-text-orange"} />
         <div className="issue-body">
-          <p className="issue-text">{issue.message}</p>
-          {!leaving && <Chips issue={issue} quiet={quiet} selected={selected} {...rest} />}
+          <p className="issue-text">{curly(issue.message)}</p>
+          {!leaving && !confirmField && <Chips issue={issue} quiet={quiet} selected={selected} {...rest} />}
+          {!leaving && confirmField && (
+            <>
+              <p className="issue-help">Open it beside the photo. If the photo shows the same, choose <strong>Keep</strong> to confirm it as written; otherwise type the right one.</p>
+              <div className="issue-actions">
+                <button className={`btn btn-small ${active ? "btn-quiet" : "btn-primary"}`} data-fid={confirmField} onClick={() => rest.onSelect(confirmField, { scroll: true })} aria-pressed={active}>
+                  Check the {confirmField === "header.month_year" ? "month" : "member count"} on the photo
+                </button>
+              </div>
+            </>
+          )}
+          {!leaving && opening && (
+            <div className="issue-actions">
+              <button className="btn btn-small btn-primary" onClick={() => onNewGroup("book")}>Enter its totals from the mother book</button>
+            </div>
+          )}
         </div>
       </div>
     </li>
@@ -160,7 +180,7 @@ function MemberCorrection({ issue, sub, sid, act, leaving, selected, ...rest }) 
 }
 
 /** The group name on the form isn't a tab in Palmera's workbook. */
-function UnknownGroup({ issue, sid, act, leaving, editable, fields }) {
+function UnknownGroup({ issue, sid, act, leaving, editable, fields, onNewGroup }) {
   const [tabs, setTabs] = useState(null);
   const [pick, setPick] = useState("");
   useEffect(() => {
@@ -172,7 +192,7 @@ function UnknownGroup({ issue, sid, act, leaving, editable, fields }) {
       <div className="issue-inner">
         <Icon name={leaving ? "checkmark" : "warn"} size={16} className={leaving ? "tone-text-green" : "tone-text-orange"} />
         <div className="issue-body">
-          <p className="issue-text">{issue.message}</p>
+          <p className="issue-text">{curly(issue.message)}</p>
           {!leaving && editable && (
             <div className="group-pick">
               <label className="edit-label" htmlFor="shg-pick">Which group is “{written || "this"}”?</label>
@@ -185,8 +205,8 @@ function UnknownGroup({ issue, sid, act, leaving, editable, fields }) {
                   Use this group
                 </button>
               </div>
-              <button className="btn btn-small btn-quiet" onClick={() => act(() => api.newGroup(sid), "Marked as a new group")}>
-                It’s a new group
+              <button className="btn btn-small btn-quiet" onClick={() => onNewGroup?.("start")}>
+                It’s a new group…
               </button>
             </div>
           )}

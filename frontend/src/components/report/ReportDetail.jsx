@@ -1,11 +1,11 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { api, pageUrl } from "../../api.js";
-import { fieldName, fieldType, monthName, relTime, statusOf } from "../../format.js";
+import { fieldName, fieldType, monthName, officerError, relTime, statusOf } from "../../format.js";
 import { go } from "../../route.js";
 import Icon from "../Icon.jsx";
 import Menu from "../Menu.jsx";
 import PhotoViewer from "../PhotoViewer.jsx";
-import { ForceSheet, RejectSheet } from "./ActionSheets.jsx";
+import { ForceSheet, NewGroupSheet, RejectSheet } from "./ActionSheets.jsx";
 import Inspector from "./Inspector.jsx";
 import IssueList from "./IssueList.jsx";
 import { EDITED, errorsOf, reviewOrder, sortIssues, suggestionFor } from "./ranking.js";
@@ -35,7 +35,10 @@ export default function ReportDetail({ id, filter, template, notify, refresh }) 
   const subRef = useRef(null);
   subRef.current = sub;
 
+  const opener = useRef(null);
   const select = useCallback((fid, opts = {}) => {
+    const a = document.activeElement;
+    if (fid && a && a !== document.body && !a.closest?.(".inspector")) opener.current = a;
     setSelected(fid);
     if (!fid) return;
     const box = subRef.current?.record?.fields?.[fid]?.box;
@@ -76,7 +79,8 @@ export default function ReportDetail({ id, filter, template, notify, refresh }) 
   }, [id]);
 
   useEffect(() => {
-    load();
+    // while an action runs, its own result is what we show: no poll in between
+    if (!busy) load();
     const t = setInterval(() => !document.hidden && !busy && load(), 3000);
     return () => clearInterval(t);
   }, [load, busy]);
@@ -120,7 +124,7 @@ export default function ReportDetail({ id, filter, template, notify, refresh }) 
       refresh();
       return next || r || true;
     } catch (e) {
-      notify(e.message, "red");
+      notify(officerError(e.message), "red");
       return null;
     } finally {
       setBusy(false);
@@ -154,16 +158,61 @@ export default function ReportDetail({ id, filter, template, notify, refresh }) 
     else if (now === "awaiting_member") notify("Sent to the member on WhatsApp", "green");
     else notify("The workbook still couldn't be written: see the message in the report", "red");
     go(`inbox/${now}/${id}`);
+    // the header's own buttons change: put focus on the report title so the next Tab is in the report
+    setTimeout(() => document.getElementById("report-title")?.focus({ preventScroll: true }), 80);
   };
 
-  // keyboard: Esc closes the inspector, J / K move between flagged values
+  const [reading, setReading] = useState(false);
+  const readNow = async () => {
+    setReading(true);
+    const r = await act(() => api.processNow(id), null);
+    setReading(false);
+    if (r?.status === "needs_review") go(`inbox/needs_review/${id}`);
+    else if (r?.status) go(`inbox/${r.status}/${id}`);
+  };
+  const resend = async () => {
+    const r = await act(() => api.resend(id), null);
+    if (!r) return;
+    if (r.failed) notify(officerError(r.delivery_error || "WhatsApp still couldn’t deliver it. Try again later."), "red");
+    else notify(r.resent === 1 ? "Message delivered" : `${r.resent} messages delivered`, "green");
+  };
+  const menuButton = () => root.current?.querySelector(".detail-actions .menu > button") || document.getElementById("report-title");
+
+  // Closing the inspector puts focus back on the value's own cell (or the chip that opened it),
+  // so the next Tab continues where the officer was instead of restarting at the sidebar.
+  const close = useCallback(() => {
+    const fid = selected;
+    const had = root.current?.querySelector(".inspector")?.contains(document.activeElement);
+    setSelected(null);
+    if (!fid || (!had && document.activeElement !== document.body)) return;
+    requestAnimationFrame(() => {
+      const cells = [...(root.current?.querySelectorAll(`[data-fid="${CSS.escape(fid)}"]`) || [])];
+      const cell = cells.find((c) => c === opener.current) || cells[0];
+      (cell || head.current?.querySelector("h1"))?.focus();
+    });
+  }, [selected]);
+
+  // keyboard: Esc closes the inspector; Alt+↓ / Alt+↑ (also J / K outside a text field) move
+  // between flagged values. Alt works while typing in the value field, where a letter would not.
   const order = sub ? reviewOrder(sub) : [];
   const flaggedList = sub?.status === "needs_review" ? [...new Set([...order, ...Object.keys(sub.validation?.flagged || {})])].filter((f) => sub.record?.fields?.[f]) : [];
   useEffect(() => {
+    const move = (d) => {
+      const i = flaggedList.indexOf(selected);
+      const n = d > 0 ? (i + 1) % flaggedList.length : (i <= 0 ? flaggedList.length - 1 : i - 1);
+      select(flaggedList[n], { scroll: true });
+    };
     const onKey = (e) => {
-      if (document.querySelector("dialog[open]") || e.metaKey || e.ctrlKey || e.altKey) return;
+      if (document.querySelector("dialog[open]") || e.metaKey || e.ctrlKey) return;
+      if (e.altKey && (e.key === "ArrowDown" || e.key === "ArrowUp") && flaggedList.length) {
+        e.preventDefault();
+        move(e.key === "ArrowDown" ? 1 : -1);
+        return;
+      }
+      if (e.altKey) return;
       if (e.key === "Escape" && selected) {
-        setSelected(null);
+        e.preventDefault();
+        close();
         return;
       }
       const t = e.target;
@@ -171,14 +220,12 @@ export default function ReportDetail({ id, filter, template, notify, refresh }) 
       const k = e.key.toLowerCase();
       if ((k === "j" || k === "k") && flaggedList.length) {
         e.preventDefault();
-        const i = flaggedList.indexOf(selected);
-        const n = k === "j" ? (i + 1) % flaggedList.length : (i <= 0 ? flaggedList.length - 1 : i - 1);
-        select(flaggedList[n], { scroll: true });
+        move(k === "j" ? 1 : -1);
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [selected, flaggedList.join(","), select]);
+  }, [selected, flaggedList.join(","), select, close]);
 
   if (!sub) {
     if (loadError) {
@@ -215,10 +262,21 @@ export default function ReportDetail({ id, filter, template, notify, refresh }) 
   const recorded = errors.some((i) => i.rule === "month_already_recorded");
   const can = (k, fallback) => (sub.actions && k in sub.actions ? !!sub.actions[k] : fallback);
 
+  // "Send anyway" can't bypass these: each needs its own decision (the server refuses with 409)
+  const NO_FORCE = {
+    unknown_shg: "Decide first whether this is a new group.",
+    opening_inconsistent: "Enter the group’s totals from the mother book first.",
+    month_out_of_range: "The month doesn’t fit the workbook: correct the month first.",
+    month_unexpected: "Check the month on the photo first: keep it as written or correct it.",
+  };
+  const forceBlock = errors.map((i) => NO_FORCE[i.rule]).find(Boolean);
+  const failedNoRetry = sub.status === "failed" && !can("retry", true);
   const menu = [
-    review && can("approve", true) && errors.length > 0 && { label: "Send anyway…", icon: "send", onClick: () => setSheet("force") },
-    can("reject", ["needs_review", "collecting", "failed"].includes(sub.status)) && { label: "Ask for a new photo…", icon: "photo", onClick: () => setSheet("reject") },
+    review && can("approve", true) && errors.length > 0 && { label: "Send anyway…", icon: "send", disabled: !!forceBlock, note: forceBlock, onClick: () => setSheet("force") },
+    !failedNoRetry && can("reject", ["needs_review", "collecting", "failed"].includes(sub.status)) && { label: "Ask for a new photo…", icon: "photo", onClick: () => setSheet("reject") },
+    can("opening", false) && { label: "Change its opening totals…", icon: "book", onClick: () => setSheet("newgroup-book") },
   ];
+  const monthLabel = month ? monthName(month) : null;
 
   return (
     <article className="detail" ref={root}>
@@ -227,7 +285,7 @@ export default function ReportDetail({ id, filter, template, notify, refresh }) 
           <Icon name="back" size={22} />
         </a>
         <div className="detail-titles">
-          <h1 className="detail-title">{name}</h1>
+          <h1 className="detail-title" id="report-title" tabIndex={-1}>{name}</h1>
           <p className="detail-sub">
             {[month && monthName(month), gn].filter(Boolean).join(", ") || `Received ${relTime(sub.created)}`}
           </p>
@@ -242,16 +300,16 @@ export default function ReportDetail({ id, filter, template, notify, refresh }) 
             </button>
           )}
           {onlyPage1 && (
-            <button className="btn btn-primary" disabled={busy} onClick={async () => {
-              const r = await act(() => api.processNow(id), "Reading page 1");
-              if (r?.status === "needs_review") go(`inbox/needs_review/${id}`);
-            }}>
-              Read page 1 now
+            <button className="btn btn-primary" disabled={busy} aria-busy={reading || undefined} onClick={readNow}
+              title="Page 2 hasn’t come: read page 1 on its own">
+              {reading ? <><span className="spinner" aria-hidden /> Reading page 1…</> : "Read page 1 now"}
             </button>
           )}
-          {can("retry", sub.status === "failed") && (
-            <button className="btn btn-primary" disabled={busy} onClick={() => act(() => api.retry(id), "Reading the photos again")}>Try again</button>
-          )}
+          {sub.status === "failed" && (failedNoRetry
+            ? <button className="btn btn-primary" disabled={busy} onClick={() => setSheet("reject-unclear")}><Icon name="photo" size={15} /> Ask for a new photo</button>
+            : can("retry", true) && <button className="btn btn-primary" disabled={busy} aria-busy={busy || undefined} onClick={() => act(() => api.retry(id), "Reading the photos again")}>
+                {busy ? <><span className="spinner" aria-hidden /> Reading…</> : "Try again"}
+              </button>)}
           <Menu items={menu} />
         </div>
       </header>
@@ -265,12 +323,21 @@ export default function ReportDetail({ id, filter, template, notify, refresh }) 
             src={(p) => pageUrl(id, p)}
             box={fv?.box?.page === page ? fv.box : null}
             label={selected ? fieldName(selected, sub.labels) : null}
-            onClear={() => setSelected(null)}
+            onClear={close}
           />
         </div>
 
         <div className="info-col">
-          <StatusCard sub={sub} errors={errors} cleared={cleared} busy={busy} onRetry={() => act(() => api.retry(id), "Reading the photos again")} />
+          <StatusCard sub={sub} errors={errors} cleared={cleared} reading={reading} />
+          {sub.undelivered > 0 && (
+            <div className="statusline tone-red delivery-line" role="status">
+              <span>
+                <Icon name="warn" size={14} /> {sub.undelivered === 1 ? "One WhatsApp message wasn’t delivered" : `${sub.undelivered} WhatsApp messages weren’t delivered`}
+                {undeliveredWhy(sub.log) ? `: ${undeliveredWhy(sub.log)}` : "."}
+              </span>
+              {can("resend", true) && <button className="btn btn-small btn-primary" disabled={busy} onClick={resend}>Resend</button>}
+            </div>
+          )}
           {sub.record && <Impact sub={sub} errors={errors} />}
 
           {fv && (
@@ -286,12 +353,14 @@ export default function ReportDetail({ id, filter, template, notify, refresh }) 
               reportStatus={sub.status}
               editable={review}
               busy={busy}
+              canNav={flaggedList.length > 1}
               onSave={(v) => saveField(selected, v)}
-              onClose={() => setSelected(null)}
+              onClose={close}
             />
           )}
 
-          {open && <IssueList sid={id} sub={sub} errors={errors} notes={notes} order={order} selected={selected} onSelect={select} act={act} showW5={showW5} />}
+          {open && <IssueList sid={id} sub={sub} errors={errors} notes={notes} order={order} selected={selected} onSelect={select} act={act} showW5={showW5}
+            onNewGroup={(mode) => setSheet(mode === "book" ? "newgroup-book" : "newgroup-start")} />}
 
           {sub.monthly && template && ["needs_review", "awaiting_member"].includes(sub.status) && (
             <MonthlyList template={template} sub={sub} flagged={flagged} selected={selected} onSelect={select} />
@@ -306,19 +375,35 @@ export default function ReportDetail({ id, filter, template, notify, refresh }) 
 
           {template && sub.record && <PageTwo template={template} fields={fields} flagged={flagged} selected={selected} onSelect={select} review={review} />}
 
-          <Conversation sid={id} log={sub.log} lang={sub.lang} />
+          <Conversation sid={id} log={sub.log} lang={sub.lang} onResend={can("resend", true) ? resend : null} busy={busy} />
         </div>
       </div>
 
-      <ForceSheet open={sheet === "force"} onClose={() => setSheet(null)} errors={errors.length} busy={busy} recorded={recorded}
+      <ForceSheet open={sheet === "force"} onClose={() => setSheet(null)} errors={errors.length} busy={busy} recorded={recorded} returnFocus={menuButton}
         onConfirm={(reason) => send({ force: true, reason, overwrite: recorded })} />
-      <RejectSheet open={sheet === "reject"} onClose={() => setSheet(null)} busy={busy}
+      <RejectSheet open={sheet === "reject" || sheet === "reject-unclear"} initialCode={sheet === "reject-unclear" ? "unclear" : ""} onClose={() => setSheet(null)} busy={busy} returnFocus={menuButton}
         onConfirm={async (code, note) => {
           const r = await act(() => api.reject(id, code, note), "Asked her for a new photo");
+          if (r) {
+            setSheet(null);
+            setTimeout(() => document.getElementById("report-title")?.focus({ preventScroll: true }), 80);
+          }
+        }} />
+      <NewGroupSheet open={sheet === "newgroup-start" || sheet === "newgroup-book"} initialMode={sheet === "newgroup-book" ? "book" : "start"}
+        onClose={() => setSheet(null)} busy={busy} returnFocus={menuButton}
+        rows={template?.opening_rows} suggestion={sub.opening_suggestion} current={sub.opening} name={name !== "New report" ? name : null} monthLabel={monthLabel}
+        onConfirm={async (choice) => {
+          const r = await act(() => api.newGroup(id, choice), choice.startedThisMonth ? "Saved: the group started this month" : "Saved: its totals from the mother book");
           if (r) setSheet(null);
         }} />
     </article>
   );
+}
+
+/** Why WhatsApp refused the newest undelivered message, in the backend's officer wording. */
+function undeliveredWhy(log) {
+  const m = [...(log || [])].reverse().find((e) => e.from === "bot" && e.delivered === false);
+  return m?.delivery_error ? String(m.delivery_error).replace(/\.$/, "") + "." : null;
 }
 
 /** What the system did on this report, in one line: the impact, visible. */

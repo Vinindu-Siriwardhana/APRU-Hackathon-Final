@@ -16,6 +16,7 @@ from app import messages as M
 from app import workbook as W
 from app.aggregate import to_monthly
 from app.demo_reader import DemoReader, SampleIndex
+from app.validation import OPENING_LABELS
 from app.extraction import ExtractionError, SimulatedReader
 from app.imaging.io import read_image
 from app.models import FieldStatus, FieldValue, FormRecord, Legibility, PriorMonth
@@ -347,7 +348,9 @@ def test_unknown_group_blocks_until_officer_confirms_new_group(pipe):
     sub = Submission(sender="n1", record=record(month(**{"header.shg_name": "Nilam"})), status=Status.needs_review)
     pipe._lookup_prior(sub); pipe.revalidate(sub)
     assert "unknown_shg" in rules(sub.validation)
-    pipe.confirm_new_group(sub, "anu")
+    opening = {label: 0 for label in OPENING_LABELS}
+    opening["Total savings to date (Rs.)"] = 12500             # month() starts with Rs 12,500 cash
+    pipe.confirm_new_group(sub, "anu", opening=opening)
     assert "unknown_shg" in rules(sub.validation, "warning") and sub.validation.auto_accept
     pipe.officer_approve(sub, "anu"); pipe.store.save(sub)
     sub, _ = pipe.member_reply("n1", "OK")
@@ -381,7 +384,7 @@ def test_demo_reader_does_not_invent_data(env):
     assert reply == M.t("demo_unknown_photo", "en")
     p.receive_image("u2", photo("kalaimagal_2026-10_p1.jpg"), source="kalaimagal_2026-10_p1.jpg")
     sub, _ = p.receive_image("u2", photo("vasantham_2026-10_p2.jpg"), source="vasantham_2026-10_p2.jpg")
-    assert sub.status == Status.failed and "different sample reports" in sub.failure
+    assert sub.status == Status.failed and "different demo samples" in sub.failure
 
 
 def test_process_now_reads_page1_alone(env):
@@ -449,7 +452,7 @@ def test_member_reply_formats(text, n, value):
     assert kind == "correct" and item == n and M.parse_amount(raw) == value
 
 
-@pytest.mark.parametrize("text", ["300 310", "512000", "10 5000", "hello", "OK 5 12000", ""])
+@pytest.mark.parametrize("text", ["300 310", "512000", "11 5000", "hello", "OK 5 12000", ""])
 def test_member_reply_rejects_ambiguous(text):
     kind, arg = M.parse_member_reply(text)
     if kind == "correct":                                        # e.g. never for these

@@ -33,9 +33,39 @@ export const STATUS = {
   superseded: { label: "Replaced", tone: "grey" },
   rejected: { label: "New photo asked", tone: "grey" },
 };
+/** Ready to send and Recorded are different stages, so they never share a tag. */
+export const READY = { label: "Ready to send", tone: "teal" };
 export const statusOf = (s) => {
-  if (s?.status === "needs_review" && s.errors === 0) return { label: "Ready to send", tone: "green" };
+  if (s?.status === "needs_review" && s.errors === 0) return READY;
   return STATUS[s?.status] || STATUS.collecting;
+};
+
+/** "1 report", "3 reports". */
+export const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
+
+/** Backend text uses straight quotes; the interface uses typographic ones throughout. */
+export const curly = (text) =>
+  text === null || text === undefined
+    ? text
+    : String(text)
+        .replace(/(\w)'(\w)/g, "$1’$2")
+        .replace(/(^|[\s([{—-])'/g, "$1‘")
+        .replace(/'/g, "’")
+        .replace(/(^|[\s([{—-])"/g, "$1“")
+        .replace(/"/g, "”");
+
+/**
+ * A backend error in words for an officer. Messages written for developers
+ * ("not a number: 'j'") become plain sentences; anything else passes through, curly-quoted.
+ */
+export const officerError = (message) => {
+  const m = String(message || "");
+  if (/not a number|could not convert|invalid (number|amount)|must be a number|not a valid number/i.test(m))
+    return "That isn’t a figure. Type it in digits, for example 1,200.";
+  if (/negative/i.test(m)) return "A figure on the form can’t be negative.";
+  if (/not a (valid )?month|month must|bad month|unknown month/i.test(m)) return "Type the month as it is on the form, for example October 2026 or 2026-10.";
+  if (/Internal Server Error|error 5\d\d/i.test(m)) return "Something went wrong on the server. Try again in a moment.";
+  return curly(m);
 };
 
 /** "just now", "5 min ago" — lower case, so it reads inside a sentence. */

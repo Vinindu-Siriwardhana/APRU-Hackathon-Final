@@ -121,7 +121,7 @@ def seed(out: Path) -> Path:
     order = [n for n in GROUPS if n != OPENING_TAB] + [OPENING_TAB]
     for name, g in GROUPS.items():
         rows, opening = plans[name]
-        wb.write_month(name, MONTHS[0], rows[0], gn_name=g["gn"], opening=opening, create_tab=True)
+        wb.write_month(name, MONTHS[0], rows[0], gn_name=g["gn"], to_date=opening, create_tab=True)
     for i, month in enumerate(MONTHS[1:], start=1):
         for name in order:
             wb.write_month(name, month, plans[name][0][i], gn_name=GROUPS[name]["gn"], create_tab=True)

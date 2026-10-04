@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, sampleUrl, store } from "./api.js";
+import { officerError } from "./format.js";
 
 /**
  * The simulated member's phone. Its state lives at the top of the app (not inside the
@@ -78,7 +79,7 @@ export function usePhone({ onActivity, notify }) {
       await load(who);
       activity.current?.();
     } catch (e) {
-      notify?.(e.message, "red");
+      notify?.(officerError(e.message), "red");
     } finally {
       setPending(null);
       setSending(false);

@@ -119,6 +119,12 @@ class PriorMonth(BaseModel):
     # True when the month being submitted already has figures in the workbook
     # (set from GNWorkbook.month_recorded); validation then blocks the report.
     this_month_recorded: bool = False
+    # "workbook" (last month's column) or "opening" (a new group's opening totals, built by
+    # validation.prior_from_opening). Only changes how the week-1 checks word their messages.
+    source: str = "workbook"
+    # A new group the officer says started this month (opening totals all zero): validation
+    # then checks the form's own to-date figures agree (opening_inconsistent).
+    started_this_month: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -199,6 +205,7 @@ def normalise(value: Any, ftype: str) -> Any:
     return s or None
 
 
+MIN_YEAR, MAX_YEAR = 2000, 2100
 _MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
 
@@ -208,6 +215,8 @@ def normalise_month(value: Any) -> Optional[str]:
     if value is None:
         return None
     if isinstance(value, date):
+        if not MIN_YEAR <= value.year <= MAX_YEAR:
+            raise ValueError(f"not a plausible year: {value!r}")
         return f"{value.year:04d}-{value.month:02d}"
     s = str(value).strip().lower()
     if not s:
@@ -228,4 +237,6 @@ def normalise_month(value: Any) -> Optional[str]:
         y += 2000
     if not 1 <= mo <= 12:
         raise ValueError(f"not a month: {value!r}")
+    if not MIN_YEAR <= y <= MAX_YEAR:          # '10/1926', '10/3026': a misread year, never a column
+        raise ValueError(f"not a plausible year: {value!r}")
     return f"{y:04d}-{mo:02d}"

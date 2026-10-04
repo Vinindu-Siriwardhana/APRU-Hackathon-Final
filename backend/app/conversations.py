@@ -16,6 +16,8 @@ import json
 import logging
 import re
 import shutil
+import threading
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -28,10 +30,16 @@ log = logging.getLogger("shg.conversations")
 
 MAX_MESSAGES = 500          # per sender; older messages are dropped from the phone view
 MAX_SEEN_IDS = 5000         # WhatsApp message ids remembered for de-duplication
+MAX_IN_FLIGHT = 500         # WhatsApp messages accepted but not processed yet (more: 503, Meta retries)
 
 
 def now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def new_mid() -> str:
+    """Id of one bot message, shared by the submission log and the conversation log."""
+    return uuid.uuid4().hex[:12]
 
 
 def safe_name(sender: str) -> str:
@@ -61,14 +69,26 @@ class Conversation(BaseModel):
             m["sid"] = sid
         self._append(m)
 
-    def add_bot(self, reply: str, sid: Optional[str] = None) -> None:
-        m: dict[str, Any] = {"at": now(), "from": "bot", "text": str(reply)}
+    def add_bot(self, reply: str, sid: Optional[str] = None) -> str:
+        """Record a bot message. `delivered` is None until a WhatsApp send reports back
+        (and stays None for the simulator, where nothing is sent). Returns its id."""
+        mid = getattr(reply, "mid", None) or new_mid()
+        m: dict[str, Any] = {"at": now(), "from": "bot", "text": str(reply), "mid": mid,
+                             "delivered": None, "delivery_error": None}
         en = getattr(reply, "en", None)
         if en:
             m["text_en"] = en
         if sid:
             m["sid"] = sid
         self._append(m)
+        return mid
+
+    def bot_message(self, *, mid: Optional[str] = None, wamid: Optional[str] = None) -> Optional[dict[str, Any]]:
+        """The newest bot message with this id (ours, or the WhatsApp id Meta gave it)."""
+        for m in reversed(self.messages):
+            if m.get("from") == "bot" and ((mid and m.get("mid") == mid) or (wamid and m.get("wamid") == wamid)):
+                return m
+        return None
 
     def event(self, kind: str, /, **kw: Any) -> None:
         self.events.append({"at": now(), "event": kind, **kw})
@@ -115,27 +135,65 @@ class Conversations:
 
 class SeenMessages:
     """WhatsApp message ids already handled. Meta re-delivers a message when our 200
-    is slow or lost; without this, a re-delivered page 2 starts a second report."""
+    is slow or lost; without this, a re-delivered page 2 starts a second report.
+
+    claim() is called by the webhook itself (in memory, no file I/O and no global lock, so a
+    burst of photo uploads can't delay Meta's 200). An id is written to disk by done() only
+    once its message has been processed (or failed for good); until then it is "in flight",
+    so a re-delivery that arrives meanwhile is still ignored."""
 
     def __init__(self, root: Path):
         self.path = Path(root) / "whatsapp_seen.json"
+        self._mu = threading.Lock()
+        self._seen: dict[str, None] = dict.fromkeys(self._load())     # ordered, oldest first
+        self._in_flight: set[str] = set()
 
     def _load(self) -> list[str]:
         try:
-            return json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else []
+            data = json.loads(self.path.read_text(encoding="utf-8")) if self.path.exists() else []
+            return [x for x in data if isinstance(x, str)] if isinstance(data, list) else []
         except (OSError, ValueError):
             return []
 
-    def first_time(self, msg_id: Optional[str]) -> bool:
-        """True (and remembered) the first time an id is seen. Messages without an id
-        can't be de-duplicated and always count as new."""
+    def busy(self) -> bool:
+        """Too many messages accepted and not processed yet: refuse more for now."""
+        return len(self._in_flight) >= MAX_IN_FLIGHT
+
+    def claim(self, msg_id: Optional[str]) -> bool:
+        """True the first time an id is seen (it is then in flight until done()). Messages
+        without an id can't be de-duplicated and always count as new."""
         if not msg_id:
             return True
-        with lock:
-            seen = self._load()
-            if msg_id in seen:
+        with self._mu:
+            if msg_id in self._seen or msg_id in self._in_flight:
                 return False
-            seen.append(msg_id)
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            atomic_write_text(self.path, json.dumps(seen[-MAX_SEEN_IDS:]))
+            self._in_flight.add(msg_id)
             return True
+
+    def done(self, msg_id: Optional[str]) -> None:
+        """The message was processed (or failed for good): remember it on disk."""
+        if not msg_id:
+            return
+        with self._mu:
+            self._in_flight.discard(msg_id)
+            self._seen[msg_id] = None
+            while len(self._seen) > MAX_SEEN_IDS:
+                del self._seen[next(iter(self._seen))]
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                atomic_write_text(self.path, json.dumps(list(self._seen)))
+            except OSError as e:                      # memory still de-duplicates
+                log.warning("could not save seen WhatsApp ids: %s", e)
+
+    def release(self, msg_id: Optional[str]) -> None:
+        """Forget an in-flight id without processing it (we answered Meta 503: it retries)."""
+        if msg_id:
+            with self._mu:
+                self._in_flight.discard(msg_id)
+
+    def first_time(self, msg_id: Optional[str]) -> bool:
+        """claim() + done() in one step."""
+        fresh = self.claim(msg_id)
+        if fresh:
+            self.done(msg_id)
+        return fresh

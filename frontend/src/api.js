@@ -40,7 +40,12 @@ export const api = {
   rejectReasons: () => req("/api/reject-reasons"),
   retry: (id) => post(`${sid(id)}/retry`),
   processNow: (id) => post(`${sid(id)}/process-now`),
-  newGroup: (id) => post(`${sid(id)}/new-group`, { officer: OFFICER }),
+  /** A group with no tab yet: it started this month (opening totals all 0), or its nine
+   *  "to date" totals BEFORE this month from the mother book, keyed by template.opening_rows. */
+  newGroup: (id, { startedThisMonth = false, opening = null } = {}) =>
+    post(`${sid(id)}/new-group`, { officer: OFFICER, started_this_month: startedThisMonth, opening: startedThisMonth ? null : opening }),
+  /** Re-send the bot messages WhatsApp didn't deliver, in order: {resent, failed, delivery_error, submission}. */
+  resend: (id) => post(`${sid(id)}/resend`, { officer: OFFICER }),
   shgTabs: () => req("/api/shg-tabs"),
   groups: () => req("/api/groups"),
   samples: () => req("/api/sim/samples"),

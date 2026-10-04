@@ -1,11 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { OFFICER, cropUrl } from "../../api.js";
-import { display, fieldParts, money, num } from "../../format.js";
+import { curly, display, fieldParts, money, num } from "../../format.js";
 import Icon from "../Icon.jsx";
 
 const asText = (v) => (v === null || v === undefined ? "" : typeof v === "boolean" ? (v ? "Yes" : "No") : String(v));
 const coarse = () => typeof window !== "undefined" && window.matchMedia?.("(pointer: coarse)").matches;
 const INPUT_MODE = { money: "decimal", int: "numeric", text: "text", month: "text", date: "text" };
+/** The key officers hold to move between flagged values: Option on a Mac, Alt elsewhere. */
+export const ALT_KEY = typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform || "") ? "⌥" : "Alt";
+/** Money and counts take digits only: a stray letter never reaches the field, let alone the server. */
+const NUMERIC = { money: /[^0-9.,\s]/g, int: /[^0-9,\s]/g };
+const isFigure = (v, type) => v === "" || !NUMERIC[type] || /^\d[\d,\s]*(\.\d+)?$|^\.\d+$/.test(v.trim());
 
 /** What we can honestly say about a value, given where the whole report is. */
 function statusText(fv, reportStatus) {
@@ -21,11 +26,11 @@ function statusText(fv, reportStatus) {
  * The selected value: the handwriting itself, what the AI read, what the ledger suggests,
  * and the officer's three choices — Use the suggestion, Save a typed value, Keep as written.
  */
-export default function Inspector({ sid, fid, fv, type, labels, issues, suggestion, reportStatus, editable, busy, onSave, onClose }) {
+export default function Inspector({ sid, fid, fv, type, labels, issues, suggestion, reportStatus, editable, busy, canNav, onSave, onClose }) {
   const initial = asText(fv.value);
   const [val, setVal] = useState(initial);
   const [picked, setPicked] = useState(false);
-  const [hint, setHint] = useState(false);
+  const [hint, setHint] = useState(false); // false | "choose" | "figure"
   const [cropOk, setCropOk] = useState(true);
   const input = useRef(null);
   const passes = (fv.passes || []).map(asText);
@@ -48,6 +53,11 @@ export default function Inspector({ sid, fid, fv, type, labels, issues, suggesti
   const submit = (e) => {
     e?.preventDefault();
     if (busy) return;
+    if (!isFigure(val, type)) {
+      setHint("figure");
+      input.current?.focus({ preventScroll: true });
+      return;
+    }
     onSave(val.trim() === "" ? null : val.trim());
   };
 
@@ -77,6 +87,7 @@ export default function Inspector({ sid, fid, fv, type, labels, issues, suggesti
         <div className="read-as">
           <span className="read-as-label">Read as</span>
           <span className="read-as-value">{readAs === null || readAs === "" ? "Blank" : isMoney && !isNaN(Number(readAs)) ? num(Number(readAs)) : readAs}</span>
+          {passes.length > 1 && !disagree && <span className="read-as-note">Both readings agree</span>}
           {!fv.box && <span className="muted small">This value has no place on the photo.</span>}
         </div>
       </div>
@@ -123,12 +134,22 @@ export default function Inspector({ sid, fid, fv, type, labels, issues, suggesti
 
       {editable ? (
         <form className="edit" onSubmit={submit}>
-          <label className="edit-label" htmlFor="edit-value">{fid.includes("meeting_held") ? "Was a meeting held?" : "Value on the form"}</label>
+          <label className="edit-label" id="edit-label" htmlFor={isYesNo ? undefined : "edit-value"}>{fid.includes("meeting_held") ? "Was a meeting held?" : "Value on the form"}</label>
           <div className="edit-row">
             {isYesNo ? (
-              <div className="segmented" role="radiogroup" aria-label="Value">
+              <div className="segmented" role="radiogroup" id="edit-value" aria-labelledby="edit-label"
+                onKeyDown={(e) => {
+                  const opts = ["Yes", "No", ""];
+                  const d = e.key === "ArrowRight" || e.key === "ArrowDown" ? 1 : e.key === "ArrowLeft" || e.key === "ArrowUp" ? -1 : 0;
+                  if (!d || e.altKey) return;
+                  e.preventDefault();
+                  const n = opts[(opts.indexOf(val) + d + opts.length) % opts.length];
+                  setVal(n);
+                  e.currentTarget.querySelector(`[data-v="${n}"]`)?.focus();
+                }}>
                 {["Yes", "No", ""].map((o) => (
-                  <button key={o || "blank"} type="button" role="radio" aria-checked={val === o} className={val === o ? "is-on" : ""} onClick={() => setVal(o)}>
+                  <button key={o || "blank"} type="button" role="radio" data-v={o} aria-checked={val === o} tabIndex={val === o || (!["Yes", "No", ""].includes(val) && o === "Yes") ? 0 : -1}
+                    className={val === o ? "is-on" : ""} onClick={() => setVal(o)}>
                     {o || "Blank"}
                   </button>
                 ))}
@@ -140,7 +161,8 @@ export default function Inspector({ sid, fid, fv, type, labels, issues, suggesti
                 className="field"
                 value={val}
                 onChange={(e) => {
-                  setVal(e.target.value);
+                  const clean = NUMERIC[type] ? e.target.value.replace(NUMERIC[type], "") : e.target.value;
+                  setVal(clean);
                   setPicked(false);
                   setHint(false);
                 }}
@@ -150,7 +172,7 @@ export default function Inspector({ sid, fid, fv, type, labels, issues, suggesti
                   // wrong: ask for an explicit choice instead
                   if (e.key === "Enter" && !changed && !picked && suggestion) {
                     e.preventDefault();
-                    setHint(true);
+                    setHint("choose");
                   }
                 }}
                 placeholder="Blank"
@@ -166,17 +188,20 @@ export default function Inspector({ sid, fid, fv, type, labels, issues, suggesti
               </button>
             ) : (
               <button className={`btn ${suggestion ? "btn-quiet" : "btn-primary"}`} disabled={busy} title="The photo shows this value: keep it as written">
-                Keep {initial === "" ? "blank" : isMoney ? num(Number(initial)) : initial}
+                Keep {initial === "" ? "blank" : isMoney ? num(Number(initial)) : display(initial, type) || initial}
               </button>
             )}
           </div>
           {hint ? (
             <p className="edit-hint is-warn" id="edit-hint" role="alert">
-              The checks say this doesn’t add up. Type the figure on the photo, use the suggestion, or choose Keep.
+              {hint === "figure"
+                ? "That isn’t a figure. Type it in digits, as on the photo, for example 1,200."
+                : "The checks say this doesn’t add up. Type the figure on the photo, use the suggestion, or choose Keep."}
             </p>
           ) : (
             <p className="edit-hint" aria-hidden>
-              <kbd>Enter</kbd> save and go to the next <kbd>Esc</kbd> close <kbd>J</kbd> <kbd>K</kbd> next or previous flagged value
+              <span><kbd>Enter</kbd> save and go to the next</span> <span><kbd>Esc</kbd> close</span>
+              {canNav && <span><kbd>{ALT_KEY}</kbd><kbd>↓</kbd><kbd>↑</kbd> next or previous flagged value</span>}
             </p>
           )}
         </form>
@@ -195,7 +220,7 @@ export default function Inspector({ sid, fid, fv, type, labels, issues, suggesti
       {issues.length > 0 && (
         <details className="inspector-issues">
           <summary>{issues.length === 1 ? "1 check involves this value" : `${issues.length} checks involve this value`}</summary>
-          <ul>{issues.map((i, k) => <li key={k}>{i.message}</li>)}</ul>
+          <ul>{issues.map((i, k) => <li key={k}>{curly(i.message)}</li>)}</ul>
         </details>
       )}
     </section>

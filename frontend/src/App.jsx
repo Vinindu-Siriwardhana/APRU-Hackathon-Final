@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { WORKBOOK_URL, api, store } from "./api.js";
 import { useHashRoute, go } from "./route.js";
+import { officerError, plural } from "./format.js";
 import { usePhone } from "./usePhone.js";
 import DemoChecklist, { demoSteps } from "./components/DemoChecklist.jsx";
 import Groups from "./components/Groups.jsx";
@@ -101,22 +102,69 @@ export default function App() {
     return c;
   }, [subs]);
 
-  const closeChecklist = useCallback(() => setChecklist(false), []);
+  // closing the Demo guide returns focus to its pill (when focus was inside the guide)
+  const guidePill = useRef(null);
+  const closeChecklist = useCallback(() => {
+    const inside = document.activeElement?.closest?.(".checklist") || document.activeElement === document.body;
+    setChecklist(false);
+    if (inside) requestAnimationFrame(() => guidePill.current?.focus());
+  }, []);
   const steps = demoSteps(subs, phone);
   const stepsDone = steps.filter((s) => s.done).length;
+  const allDone = stepsDone === steps.length;
 
   // first visit with an empty inbox: open the demo guide once
   const opened = useRef(false);
   useEffect(() => {
     if (opened.current || !loaded) return;
     opened.current = true;
-    if (subs.length === 0 && !store.get("demoGuideSeen", false)) {
+    // on a phone-sized screen it would sit over Start here: it stays in More → Demo guide
+    if (subs.length === 0 && !store.get("demoGuideSeen", false) && window.innerWidth >= 1024) {
       setChecklist(true);
       store.set("demoGuideSeen", true);
     }
   }, [loaded, subs.length]);
 
   const docked = presenter && wide && view !== "phone";
+  const isInboxView = view === "inbox" || view === "report" || !view;
+  const selectedId = isInboxView ? (view === "report" ? a : b) : null;
+
+  // The Demo guide never covers the work: it folds back to its pill when a report opens,
+  // when the phone docks beside the screen, and a moment after the last step is ticked.
+  useEffect(() => {
+    if (selectedId) setChecklist(false);
+  }, [selectedId]);
+  useEffect(() => {
+    if (docked) setChecklist(false);
+  }, [docked]);
+  const wasDone = useRef(allDone);
+  useEffect(() => {
+    if (allDone && !wasDone.current) {
+      const t = setTimeout(() => setChecklist(false), 2500);
+      wasDone.current = allDone;
+      return () => clearTimeout(t);
+    }
+    wasDone.current = allDone;
+  }, [allDone]);
+
+  // the sidebar follows the open report: once it's sent or recorded, its own list is highlighted
+  useEffect(() => {
+    if (!selectedId || view === "report") return;
+    const filter = a || "needs_review";
+    const s = subs.find((x) => x.id === selectedId);
+    if (!s || filter === "all" || s.status === filter) return;
+    const to = NAV.some((n) => n.id === s.status) ? s.status : "all";
+    window.location.replace(`#/inbox/${to}/${selectedId}`);
+  }, [subs, selectedId, a, view]);
+
+  const undelivered = useMemo(() => {
+    const c = {};
+    for (const s of subs) if (s.undelivered > 0) {
+      c[s.status] = (c[s.status] || 0) + 1;
+      c.all = (c.all || 0) + 1;
+    }
+    return c;
+  }, [subs]);
   useEffect(() => {
     if (view === "phone" || docked) phone.markSeen();
   }, [view, docked, phone.unread]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -130,12 +178,12 @@ export default function App() {
       go("inbox/needs_review");
       notify("Demo restarted", "green");
     } catch (e) {
-      notify(e.message, "red");
+      notify(officerError(e.message), "red");
     }
   };
 
   const offline = status?.mode !== "claude";
-  const isInbox = view === "inbox" || view === "report" || !view;
+  const isInbox = isInboxView;
   const navCurrent = (id) => isInbox && (a || "needs_review") === id;
   const title = (t) => (t ? `${t} · SHG Reports · Palmera` : "SHG Reports · Palmera");
   useEffect(() => {
@@ -147,7 +195,8 @@ export default function App() {
   const modePill = (where) => (
     <span className="mode" tabIndex={0} aria-describedby={`mode-tip-${where}`}>
       <span className={`mode-dot ${offline ? "" : "is-live"}`} aria-hidden />
-      {status ? (offline ? "Offline demo" : "Reading with Claude") : "Connecting…"}
+      <span className="mode-long">{status ? (offline ? "Offline demo" : "Reading with Claude") : "Connecting…"}</span>
+      <span className="mode-short" aria-hidden>{status ? (offline ? "Offline" : "Claude") : "…"}</span>
       <span className="mode-tip" role="tooltip" id={`mode-tip-${where}`}>
         {offline ? MODE_TIP : "Photos are read by Claude, twice, then checked against the ledger."}
       </span>
@@ -156,6 +205,13 @@ export default function App() {
 
   return (
     <div className={`app ${docked ? "has-dock" : ""}`}>
+      <button className="skip-link" onClick={() => {
+        const t = document.getElementById("report-title") || document.querySelector("#main h1, #main h2");
+        if (t) {
+          if (!t.hasAttribute("tabindex")) t.setAttribute("tabindex", "-1");
+          t.focus();
+        }
+      }}>{selectedId ? "Skip to the report" : "Skip to content"}</button>
       <aside className="sidebar" aria-label="Navigation">
         <div className="brand">
           <div className="brand-mark" aria-hidden><Icon name="checkmark" size={16} stroke={2.4} /></div>
@@ -172,9 +228,15 @@ export default function App() {
               aria-current={navCurrent(f.id) ? "page" : undefined} title={f.label}>
               <Icon name={f.icon} />
               <span className="nav-label">{f.label}</span>
+              <span className="nav-short" aria-hidden>{f.short}</span>
+              {undelivered[f.id] ? (
+                <span className="nav-alert" title={`${plural(undelivered[f.id], "report")} with a message not delivered`}>
+                  <Icon name="warn" size={11} stroke={2.4} /><span className="sr-only">{plural(undelivered[f.id], "report")} with a message not delivered</span>
+                </span>
+              ) : null}
               {counts[f.id] ? (
                 <span className={`nav-count ${f.id === "needs_review" ? "is-attention" : ""}`}>
-                  {counts[f.id]}<span className="sr-only"> reports</span>
+                  {counts[f.id]}<span className="sr-only"> {counts[f.id] === 1 ? "report" : "reports"}</span>
                 </span>
               ) : null}
             </a>
@@ -183,38 +245,48 @@ export default function App() {
           <a href="#/groups" className={`nav-item ${view === "groups" ? "is-active" : ""}`} aria-current={view === "groups" ? "page" : undefined} title="Groups">
             <Icon name="chart" />
             <span className="nav-label">Groups</span>
+            <span className="nav-short" aria-hidden>Groups</span>
           </a>
           <div className="nav-heading">Demo</div>
           <a href="#/phone" className={`nav-item ${view === "phone" ? "is-active" : ""}`} aria-current={view === "phone" ? "page" : undefined} title="Member’s phone">
             <Icon name="phone" />
             <span className="nav-label">Member’s phone</span>
+            <span className="nav-short" aria-hidden>Phone</span>
             {phone.unread > 0 && view !== "phone" && !docked && <span className="nav-count is-new">{phone.unread}<span className="sr-only"> new messages</span></span>}
           </a>
           <a href="#/guide" className={`nav-item ${view === "guide" ? "is-active" : ""}`} aria-current={view === "guide" ? "page" : undefined} title="Guide">
             <Icon name="book" />
             <span className="nav-label">Guide</span>
+            <span className="nav-short" aria-hidden>Guide</span>
           </a>
         </nav>
 
         <div className="sidebar-foot">
-          <button className={`guide-pill ${checklist ? "is-on" : ""}`} onClick={() => setChecklist((o) => !o)} aria-expanded={checklist} title="Demo guide">
+          <button ref={guidePill} className={`guide-pill ${checklist ? "is-on" : ""}`} onClick={() => (checklist ? closeChecklist() : setChecklist(true))} aria-expanded={checklist} title="Demo guide">
             <Icon name="list" size={16} />
             <span className="nav-label">Demo guide</span>
+            <span className="nav-short" aria-hidden>Demo {stepsDone}/{steps.length}</span>
             <span className="guide-count">{stepsDone}/{steps.length}</span>
           </button>
-          <label className="switch foot-switch" title="Show the member’s phone beside the officer screens">
-            <input type="checkbox" checked={presenter} onChange={(e) => setPresenter(e.target.checked)} />
+          <label className={`switch foot-switch ${presenter ? "is-on" : ""}`} title="Show the member’s phone beside the officer screens">
+            <input type="checkbox" checked={presenter} onChange={(e) => setPresenter(e.target.checked)} aria-describedby={presenter && !wide ? "dock-hint" : undefined} />
             <span className="switch-track" aria-hidden />
             <span className="nav-label">Show phone beside</span>
+            <span className="nav-short" aria-hidden>Beside</span>
           </label>
+          {presenter && !wide && (
+            <p className="foot-hint" id="dock-hint">The phone docks beside the screen from 1280 px wide. Widen the window, or open Member’s phone.</p>
+          )}
           <a className="foot-link" href={WORKBOOK_URL} download title="Download workbook">
             <Icon name="download" size={16} />
             <span className="nav-label">Download workbook</span>
+            <span className="nav-short" aria-hidden>Workbook</span>
           </a>
           {offline && status && (
             <button className="foot-link" onClick={() => setSheet("reset")} title="Restart demo">
               <Icon name="reset" size={16} />
               <span className="nav-label">Restart demo</span>
+              <span className="nav-short" aria-hidden>Restart</span>
             </button>
           )}
           {modePill("side")}
@@ -237,12 +309,12 @@ export default function App() {
         )}
         <div className="main-body">
           {view === "groups" && <Groups selected={a ? decodeURIComponent(a) : null} subs={subs} />}
-          {view === "phone" && <PhonePage phone={phone} />}
+          {view === "phone" && <PhonePage phone={phone} guide={checklist ? <DemoChecklist steps={steps} onClose={closeChecklist} beside inline /> : null} />}
           {view === "guide" && <Guide tab={a} offline={offline} />}
           {isInbox && (
             <Inbox
               filter={view === "report" ? "all" : a || "needs_review"}
-              selectedId={view === "report" ? a : b}
+              selectedId={selectedId}
               subs={subs}
               loaded={loaded}
               template={template}
@@ -303,7 +375,7 @@ export default function App() {
         <div className="sheet-actions"><button className="btn btn-quiet" onClick={() => setSheet(null)}>Done</button></div>
       </Sheet>
 
-      {checklist && <DemoChecklist steps={steps} onClose={closeChecklist} />}
+      {checklist && view !== "phone" && <DemoChecklist steps={steps} onClose={closeChecklist} beside={!!selectedId || view === "groups"} />}
       <Toast toast={toast} />
     </div>
   );

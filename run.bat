@@ -9,20 +9,26 @@ title SHG Reports
 rem ---------------------------------------------------------------------------
 rem  SHG Reports - Windows launcher. Double-click this file.
 rem  First run installs everything into the .venv folder (a few minutes,
-rem  about 100 MB download - do it the day before, on a good connection).
+rem  about 70-90 MB download - do it the day before, on a good connection).
+rem  Works with Python 3.10 to 3.14; Python 3.13 is the one to install.
 rem ---------------------------------------------------------------------------
 
 if not exist "backend\requirements.txt" goto :inside_zip
 
-rem --- find Python 3.10 or newer: the "py" launcher first, then "python" ------------
+rem --- find Python 3.10-3.14: 3.13 first (every library has a ready-made wheel), ----
+rem --- through the "py" launcher, then "python" on the PATH ------------------------
 set "PY="
-call :try_python py -3
+set "TOO_NEW="
+for %%v in (3.13 3.12 3.11 3.14 3.10) do if not defined PY call :try_python py -%%v
+if not defined PY call :try_python py -3
 if not defined PY call :try_python python
+if not defined PY if defined TOO_NEW goto :python_too_new
 if not defined PY goto :no_python
 
-rem --- create the environment (again, if a previous attempt was left half-made) ----
+rem --- create the environment (again, if a previous attempt was left half-made ------
+rem --- or was made with a Python this app can't use) --------------------------------
 if exist ".venv\Scripts\python.exe" (
-  ".venv\Scripts\python.exe" -c "import sys" >nul 2>nul || rmdir /s /q ".venv"
+  ".venv\Scripts\python.exe" -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 15) else 1)" >nul 2>nul || rmdir /s /q ".venv"
 )
 if exist ".venv" if not exist ".venv\Scripts\python.exe" rmdir /s /q ".venv"
 if exist ".venv\Scripts\python.exe" goto :have_venv
@@ -37,10 +43,10 @@ rem .venv\installed.txt holds a fingerprint of backend\requirements.txt
 "%VPY%" -c "import hashlib,pathlib,sys; h=hashlib.sha256(pathlib.Path('backend/requirements.txt').read_bytes()).hexdigest(); m=pathlib.Path('.venv/installed.txt'); sys.exit(0 if m.exists() and m.read_text().strip()==h else 1)"
 if not errorlevel 1 goto :check_port
 echo.
-echo Installing libraries. This takes a few minutes the first time...
+echo Installing libraries (about 70-90 MB). This takes a few minutes the first time...
 echo.
 "%VPY%" -m pip install --disable-pip-version-check -q --upgrade pip
-"%VPY%" -m pip install --disable-pip-version-check -r backend\requirements.txt
+"%VPY%" -m pip install --disable-pip-version-check --prefer-binary -r backend\requirements.txt
 if errorlevel 1 goto :pip_failed
 "%VPY%" -c "import hashlib,pathlib; pathlib.Path('.venv/installed.txt').write_text(hashlib.sha256(pathlib.Path('backend/requirements.txt').read_bytes()).hexdigest())"
 
@@ -55,7 +61,9 @@ echo ============================================================
 echo   SHG Reports is starting...
 echo   Your browser opens http://localhost:8000 by itself once the
 echo   app is ready (up to a minute the first time).
-echo   Keep this window open. Close it to stop the app.
+echo   Keep this window open. To stop the app, close this window.
+echo   (If you press Ctrl+C instead, Windows asks
+echo   "Terminate batch job (Y/N)?": type Y and press Enter.)
 echo ============================================================
 echo.
 if exist ".venv\server_stopped" del ".venv\server_stopped" >nul 2>nul
@@ -79,9 +87,15 @@ exit /b 0
 
 rem --- helpers -------------------------------------------------------------------
 :try_python
-rem Use this Python if it exists and is 3.10 or newer.
-%* -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)" >nul 2>nul
-if not errorlevel 1 set "PY=%*"
+rem Use this Python if it exists and is 3.10 to 3.14. Remember one that is too new
+rem (3.15+: some libraries have no ready-made wheel for it yet, so pip would need a compiler).
+%* -c "import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 15) else 1)" >nul 2>nul
+if not errorlevel 1 (
+  set "PY=%*"
+  exit /b 0
+)
+%* -c "import sys; raise SystemExit(0 if sys.version_info[:2] >= (3, 15) else 1)" >nul 2>nul
+if not errorlevel 1 set "TOO_NEW=%*"
 exit /b 0
 
 :open_when_ready
@@ -112,10 +126,23 @@ goto :fail
 
 :no_python
 echo.
-echo Python 3.10 or newer was not found.
-echo Install Python 3.12 from https://www.python.org/downloads/windows/
-echo and tick "Add python.exe to PATH" on the first screen of the installer.
+echo Python 3.10 to 3.14 was not found.
+echo Install Python 3.13 from
+echo   https://www.python.org/downloads/release/python-31316/
+echo (scroll down to "Windows installer (64-bit)") and tick
+echo "Add python.exe to PATH" on the first screen of the installer.
 echo Then double-click run.bat again.
+goto :fail
+
+:python_too_new
+echo.
+echo The only Python on this computer is too new for SHG Reports:
+%TOO_NEW% --version
+echo Some of the libraries it needs have no ready-made version for it yet.
+echo Install Python 3.13 as well (you can keep the newer one) from
+echo   https://www.python.org/downloads/release/python-31316/
+echo (scroll down to "Windows installer (64-bit)"), then double-click run.bat again.
+echo It finds Python 3.13 by itself.
 goto :fail
 
 :venv_failed

@@ -13,9 +13,14 @@ Every change to a value is recorded in that field's history (who, what, when), a
 bot message in the submission log carries `text` (member's language) and `text_en`.
 
 Concurrency: every load → change → save holds `lock` (one process-wide RLock); files are
-replaced atomically. Reading the handwriting is slow (Claude mode: several API calls),
-so it runs outside the lock: process() saves the photos, reads them unlocked, then
-re-loads the submission under the lock to store the result.
+replaced atomically. Slow work runs outside the lock: the photo quality check and JPEG
+encoding (receive_image), and reading the handwriting (process(): Claude mode makes several
+API calls). process() re-loads the submission under the lock to store the result, and drops
+the result if the report was rejected or withdrawn (STOP) while it was being read.
+
+Delivery: every bot message has an id (`mid`) shared by the submission log and the
+conversation log, and `delivered` (None = simulator / not attempted yet, True, False with
+`delivery_error`). The API records each WhatsApp send through record_delivery().
 """
 from __future__ import annotations
 
@@ -28,23 +33,25 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
 
+import cv2
 import numpy as np
 from pydantic import BaseModel, Field
 
 from . import messages as M
 from .aggregate import last_active_week, to_monthly
-from .conversations import Conversation, Conversations
+from .conversations import Conversation, Conversations, new_mid
 from .extraction import ExtractionError, Reader, extract
 from .imaging.io import read_image, write_image
 from .imaging.layout import Alignment, FormLocator, save_crop
 from .imaging.quality import check
 from .labels import short_label
-from .locking import atomic_write_text, lock
+from .locking import atomic_write_bytes, atomic_write_text, lock
 from .messages import Reply
 from .models import Category, FieldStatus, FieldValue, FormRecord, Issue, Legibility, PriorMonth, Severity, normalise
 from .schema import WEEKS, Template, load_template
-from .validation import ValidationResult, Validator
-from .workbook import GNWorkbook, WorkbookError, WriteReport
+from .validation import (OPENING_LABELS, ValidationResult, Validator, add_months, opening_suggestion,
+                         prior_from_opening)
+from .workbook import FIRST_COL, LAST_COL, GNWorkbook, WorkbookError, WriteReport
 
 
 log = logging.getLogger("shg.pipeline")
@@ -72,14 +79,33 @@ EDITABLE = (Status.needs_review, Status.awaiting_member)
 
 # Why an action isn't possible, per status, in words an officer understands.
 WHY_NOT = {
-    Status.collecting: "This report is still being collected: no page has been read yet.",
-    Status.needs_review: "This report is waiting for an officer's review.",
-    Status.awaiting_member: "This report was sent to the member and is waiting for her reply.",
-    Status.written: "This report is already in the workbook. It can't be changed here.",
-    Status.failed: "The photos could not be read. Use Try again, or Reject it.",
-    Status.superseded: "A newer report for this group and month replaced this one.",
-    Status.rejected: "This report was rejected.",
+    Status.collecting: "this report is still being collected, and no page has been read yet.",
+    Status.needs_review: "this report is waiting for an officer's review.",
+    Status.awaiting_member: "this report was sent to the member and is waiting for her reply.",
+    Status.written: "this report is already in the workbook, so it can't be changed here.",
+    Status.failed: "the photos could not be read. Use Try again, or ask the member for a new photo.",
+    Status.superseded: "a newer report for this group and month replaced this one.",
+    Status.rejected: "this report was rejected.",
 }
+
+# Never turned into a warning by "checked against the photo, kept as written": Palmera's hard
+# limits, and checks that are about the workbook rather than the handwriting.
+NEVER_DOWNGRADE = {"above_max", "attendance_above_capacity", "month_out_of_range", "unknown_shg",
+                   "opening_inconsistent"}
+
+# "Send anyway" can't skip these: each needs its own decision first (a write would fail or
+# land in the wrong place). month_already_recorded is skipped only by a confirmed correction.
+NOT_FORCEABLE = {
+    "unknown_shg": "this group has no tab in the workbook. Fix the group name, or use “It's a new group” first.",
+    "opening_inconsistent": "the new group's opening totals don't match the form. Enter its totals from the "
+                            "mother book first.",
+    "month_out_of_range": "the month is outside this group's columns in the workbook. Check the month on the photo.",
+    "month_unexpected": "the month on the form is not the one expected. Check it on the photo and confirm it "
+                        "as written if it is right.",
+    "month_already_recorded": "this month is already in the workbook. To replace it, confirm it as a correction "
+                              "of the recorded month, with a reason.",
+}
+UNKNOWN_SAMPLE_KINDS = ("unknown_sample", "mixed_samples")
 
 
 class StateError(Exception):
@@ -121,17 +147,31 @@ class Submission(BaseModel):
     write_error: Optional[str] = None
     write_report: Optional[WriteReport] = None
     failure: Optional[str] = None                                        # why reading failed (status failed)
+    failure_kind: Optional[str] = None                                   # unknown_sample | mixed_samples | reading | error
+    opening: Optional[dict[str, float]] = None                           # new group: the nine totals BEFORE this month
+    started_this_month: Optional[bool] = None                            # new group: officer says it started this month
+    month_error: Optional[str] = None                                    # the month is outside the tab (month_out_of_range)
     superseded_by: Optional[str] = None
     rejected_reason: Optional[str] = None
     log: list[dict[str, Any]] = Field(default_factory=list)              # chat transcript + events
 
     def say(self, reply: str) -> Reply:
-        entry: dict[str, Any] = {"at": now(), "from": "bot", "text": str(reply)}
+        """Log a bot message to the member and return it carrying its id (`mid`)."""
+        mid = new_mid()
+        entry: dict[str, Any] = {"at": now(), "from": "bot", "text": str(reply), "mid": mid,
+                                 "delivered": None, "delivery_error": None}
         en = getattr(reply, "en", None)
         if en:
             entry["text_en"] = en
         self.log.append(entry)
-        return reply if isinstance(reply, Reply) else Reply(reply)
+        return Reply(str(reply), en, mid)
+
+    def bot_entry(self, mid: Optional[str]) -> Optional[dict[str, Any]]:
+        return next((e for e in reversed(self.log) if mid and e.get("from") == "bot" and e.get("mid") == mid), None)
+
+    def undelivered(self) -> list[dict[str, Any]]:
+        """Bot messages a WhatsApp send failed for (oldest first)."""
+        return [e for e in self.log if e.get("from") == "bot" and e.get("delivered") is False]
 
     def event(self, kind: str, /, **kw: Any) -> None:
         self.log.append({"at": now(), "event": kind, **kw})
@@ -186,6 +226,10 @@ class Store:
     def for_sender(self, sender: str) -> list[Submission]:
         return [s for s in self.all() if s.sender == sender]
 
+    def awaiting_for(self, sender: str) -> Optional[Submission]:
+        """Her newest report whose summary is waiting for her OK (where OK / "5 12000" go)."""
+        return next((s for s in self.for_sender(sender) if s.status == Status.awaiting_member), None)
+
     def open_for(self, sender: str) -> Optional[Submission]:
         """The member's newest open report (where her next text goes); see Pipeline._route_text."""
         for s in self.for_sender(sender):
@@ -212,7 +256,10 @@ class Pipeline:
     # Both the WhatsApp webhook and the simulator come in here, so the member gets the
     # same answers on both, and every message lands in her conversation log.
     def on_image(self, sender: str, img: np.ndarray, *, lang: Optional[str] = None,
-                 image_name: Optional[str] = None, source: Optional[str] = None) -> tuple[Optional[Submission], Reply]:
+                 image_name: Optional[str] = None, source: Optional[str] = None
+                 ) -> tuple[Optional[Submission], Optional[Reply]]:
+        """The reply is None only when the report was rejected or withdrawn (STOP) while it
+        was being read: she has already been told, so nothing more is sent."""
         at = now()
         with lock:
             conv = self.conversations.load(sender)
@@ -230,9 +277,10 @@ class Pipeline:
             reply = M.msg("error_fallback", conv.lang)
         with lock:
             conv = self.conversations.load(sender)
-            reply = self._with_privacy(conv, reply)
             conv.add_member(is_image=True, image=image_name, sid=sub.id if sub else None, at=at)
-            conv.add_bot(reply, sub.id if sub else None)
+            if reply is not None:
+                reply = self._with_privacy(conv, reply)
+                reply.mid = conv.add_bot(reply, sub.id if sub else None)
             self.conversations.save(conv)
         return sub, reply
 
@@ -266,7 +314,7 @@ class Pipeline:
             if not conv.opted_out:
                 reply = self._with_privacy(conv, reply)
             conv.add_member(text=text, sid=sub.id if sub else None, at=at)
-            conv.add_bot(reply, sub.id if sub else None)
+            reply.mid = conv.add_bot(reply, sub.id if sub else None)
             self.conversations.save(conv)
         return sub, reply
 
@@ -276,7 +324,7 @@ class Pipeline:
             conv = self.conversations.load(sender)
             reply = self._with_privacy(conv, M.msg(reply_key, conv.lang))
             conv.add_member(text=f"[{kind}]")
-            conv.add_bot(reply)
+            reply.mid = conv.add_bot(reply)
             self.conversations.save(conv)
         return None, reply
 
@@ -315,20 +363,28 @@ class Pipeline:
                       source: Optional[str] = None) -> tuple[Submission, Reply]:
         """A photo from a member. `lang` is used when this starts a new report (default: the
         language she used last); `source` is the sample photo it is (simulator), which the
-        offline demo reader needs."""
+        offline demo reader needs.
+
+        The quality check and the JPEG encoding take seconds, so they run OUTSIDE the lock
+        (the dashboard keeps answering); the lock is held only to attach the page."""
+        with lock:
+            cur = self._collecting_for(sender)
+            if cur is not None and cur.id in self._busy:   # she re-sent a page while we read the report
+                return cur, M.msg("reading", cur.lang)
+        q = check(img, self.loc)
+        jpeg = _jpeg(img) if q.ok else None
         with lock:
             sub = self._collecting_for(sender) or Submission(sender=sender, lang=lang or self.lang_of(sender))
-            if sub.id in self._busy:                   # she re-sent a page while we read the report
+            if sub.id in self._busy:                   # reading started while we checked this photo
                 return sub, M.msg("reading", sub.lang)
             sub.log.append({"at": now(), "from": "member", "image": True})
-            q = check(img, self.loc)
             if not q.ok:
                 reply = sub.say(Reply(q.message(sub.lang), q.message("en") if sub.lang != "en" else None))
                 sub.event("quality_rejected", problem=q.problem, metrics=_jsonable(q.metrics))
                 self.store.save(sub)
                 return sub, reply
             path = self.store.ensure_dir(sub.id) / f"page{q.page}.jpg"
-            write_image(path, img)
+            atomic_write_bytes(path, jpeg)
             sub.pages[q.page] = path.name
             sub.page_sources[q.page] = source
             sub.event("page_accepted", page=q.page, metrics=_jsonable(q.metrics), sample=source)
@@ -342,7 +398,7 @@ class Pipeline:
             if reply is not None:
                 return sub, reply
         reply = self.process(sub.id)
-        return self.store.load(sub.id), reply
+        return self._load_quiet(sub.id) or sub, reply
 
     def finish_without_page2(self, sub: Submission) -> Optional[Reply]:
         """Officer (or a timeout) can process page 1 alone; page-2 answers stay empty."""
@@ -370,9 +426,10 @@ class Pipeline:
                 raise StateError(WHY_NOT.get(sub.status, "This report can't be read now."))
             self._busy.add(sid)
         try:
-            rec, error, key = self._read(sub), None, None
+            rec, error, key, kind = self._read(sub), None, None, None
         except Exception as e:
-            rec, error, key = None, _describe(e), getattr(e, "member_key", "extraction_failed")
+            rec, error, key = None, _reading_failure(e), getattr(e, "member_key", "extraction_failed")
+            kind = getattr(e, "kind", None) or ("reading" if isinstance(e, ExtractionError) else "error")
             if not isinstance(e, (ExtractionError,)) and key == "extraction_failed":
                 log.exception("reading submission %s failed", sid)
         finally:
@@ -383,13 +440,17 @@ class Pipeline:
                 sub = self.store.load(sid)
             except NotFound:                           # deleted meanwhile (demo reset)
                 return None
+            if sub.status != Status.collecting:        # rejected, or she said STOP, while we read
+                sub.event("reading_discarded", status=sub.status.value)
+                self.store.save(sub)
+                return None
             if error is not None:
-                sub.status, sub.failure = Status.failed, error
+                sub.status, sub.failure, sub.failure_kind = Status.failed, error, kind
                 sub.event("extraction_failed", reason=error)
                 reply = None if quiet_failure else sub.say(M.msg(key, sub.lang))
                 self.store.save(sub)
                 return reply
-            sub.record, sub.failure = rec, None
+            sub.record, sub.failure, sub.failure_kind = rec, None, None
             self._lookup_prior(sub)
             self.revalidate(sub)
             self._supersede_older(sub)
@@ -421,7 +482,11 @@ class Pipeline:
         return out
 
     def _save_crops(self, sid: str, rec: FormRecord, als: dict[int, Alignment]) -> None:
-        d = self.store.ensure_dir(sid) / "crops"
+        d = self.store.dir(sid) / "crops"
+        try:
+            d.mkdir(exist_ok=True)                 # never re-creates a folder a demo reset removed
+        except FileNotFoundError:
+            return
         for fid in rec.fields:
             page = 1 if fid.startswith(("header.", "weekly.")) else 2
             if page in als:
@@ -431,8 +496,9 @@ class Pipeline:
 
     def _lookup_prior(self, sub: Submission) -> None:
         """Find the SHG's tab and last month's balances. Run again whenever the officer
-        changes the SHG name or the month."""
+        changes the SHG name or the month. A new group's 'last month' is its opening totals."""
         sub.prior, sub.prior_error, sub.shg_tab, sub.shg_candidates = None, None, None, []
+        sub.month_error = None
         name = sub.record.get("header.shg_name") if sub.record else None
         month = sub.record.get("header.month_year") if sub.record else None
         if not name:
@@ -443,9 +509,23 @@ class Pipeline:
             tab, candidates = wb.find_shg(str(name))
             sub.shg_tab, sub.shg_candidates = tab, list(candidates or [])
             if tab is None:
-                sub.event("shg_not_found", name=name, candidates=sub.shg_candidates)
+                if not any(e.get("event") == "shg_not_found" and e.get("name") == name for e in sub.log):
+                    sub.event("shg_not_found", name=name, candidates=sub.shg_candidates)
+                if sub.new_group and sub.opening is not None and month:
+                    sub.prior = prior_from_opening(sub.record, sub.opening, bool(sub.started_this_month))
                 return
             if not month:
+                return
+            ws = wb.wb[tab]
+            start = wb.start_month(ws)
+            try:
+                wb.month_col(ws, str(month))
+            except WorkbookError:
+                end = add_months(start, LAST_COL - FIRST_COL)
+                sub.month_error = (f"The form says {M.month_name(month, 'en')}, but the {tab} tab in the workbook "
+                                   f"only has columns for {M.month_name(start, 'en')} to {M.month_name(end, 'en')}. "
+                                   "Check the month on the photo. If it is right, this group needs a new sheet "
+                                   "in the workbook: ask the person who manages it.")
                 return
             prior = wb.prior_month(tab, str(month)) or PriorMonth()
             prior.this_month_recorded = bool(wb.month_recorded(tab, str(month)))
@@ -455,21 +535,31 @@ class Pipeline:
             sub.event("prior_lookup_failed", error=sub.prior_error)
 
     def revalidate(self, sub: Submission) -> None:
-        res = self.validator.validate(sub.record, sub.prior)
+        mismatch = self._opening_mismatch(sub)
+        prior = None if mismatch else sub.prior        # wrong opening totals: no week-1 checks from them
+        res = self.validator.validate(sub.record, prior)
         self._member_correction_issues(sub, res)
         name = sub.record.get("header.shg_name")
         if name and sub.shg_tab is None and not any(i.rule == "unknown_shg" for i in res.issues):
             did_you_mean = f" Did you mean {', '.join(sub.shg_candidates)}?" if sub.shg_candidates else ""
-            if sub.new_group:
+            if sub.new_group and sub.opening is not None:
+                how = ("it started this month, so its opening totals are all zero" if sub.started_this_month
+                       else "its opening totals come from the mother book")
                 res.add(Issue(rule="unknown_shg", severity=Severity.warning, category=Category.continuity,
-                              message=f"'{name}' is a new group (confirmed by an officer): a new tab will be "
-                                      "created in the GN workbook when this report is written.",
+                              message=f"“{name}” is a new group (confirmed by an officer; {how}). A new tab "
+                                      "will be created in the GN workbook when this report is written.",
                               fields=["header.shg_name"]))
             else:
                 res.add(Issue(rule="unknown_shg", severity=Severity.error, category=Category.continuity,
-                              message=f"No tab for SHG '{name}' in the GN workbook.{did_you_mean} "
+                              message=f"No tab for SHG “{name}” in the GN workbook.{did_you_mean} "
                                       "Fix the name, or confirm this is a new group.",
                               fields=["header.shg_name"], expected=sub.shg_candidates or None, found=name))
+        if mismatch:
+            res.add(mismatch)
+        if sub.month_error:
+            res.add(Issue(rule="month_out_of_range", severity=Severity.error, category=Category.continuity,
+                          message=sub.month_error, fields=["header.month_year"],
+                          found=sub.record.get("header.month_year")))
         if sub.prior_error:
             res.add(Issue(rule="prior_lookup_failed", severity=Severity.warning, category=Category.continuity,
                           message=f"Couldn't read last month from the workbook ({sub.prior_error}); "
@@ -483,7 +573,7 @@ class Pipeline:
         # member's correction, the workbook, a missing value or a duplicate month.
         checked = (FieldStatus.officer_confirmed, FieldStatus.officer_corrected)
         for issue in res.issues:
-            if issue.severity != Severity.error or issue.rule in PIPELINE_RULES:
+            if issue.severity != Severity.error or issue.rule in PIPELINE_RULES | NEVER_DOWNGRADE:
                 continue
             if issue.category not in (Category.arithmetic, Category.capture, Category.range):
                 continue
@@ -492,7 +582,7 @@ class Pipeline:
                 issue.severity = Severity.warning
                 issue.category = Category.finding
                 issue.message = "Checked against the photo, kept as written: " + issue.message
-        self.validator.finish(sub.record, res, sub.prior)   # rebuilds `flagged` and the `likely` ranking
+        self.validator.finish(sub.record, res, prior)   # rebuilds `flagged` and the `likely` ranking
         sub.validation = res
         # field status follows the checks: flagged -> needs_review, no longer flagged -> auto
         for fid, fv in sub.record.fields.items():
@@ -500,6 +590,31 @@ class Pipeline:
                 fv.status = FieldStatus.needs_review
             elif fid not in res.flagged and fv.status == FieldStatus.needs_review:
                 fv.status = FieldStatus.auto
+
+    def _opening_mismatch(self, sub: Submission) -> Optional[Issue]:
+        """A new group's opening totals (from the mother book) against what the form itself
+        says they were: savings to date and loans outstanding before the month. (For a group
+        that 'started this month' validation raises opening_inconsistent itself.)"""
+        if not (sub.record and sub.new_group and sub.opening and not sub.started_this_month
+                and sub.shg_tab is None):
+            return None
+        form = opening_suggestion(sub.record, self.t)
+        month = M.month_name(sub.record.get("header.month_year"), "en")
+        parts, cells = [], []
+        for label, what, row in (("Total savings to date (Rs.)", "total savings to date", "savings_to_date"),
+                                 ("Total Loans outstanding to date (Rs.)", "total loans outstanding", "loans_outstanding")):
+            want, given = form.get(label), sub.opening.get(label)
+            if want is None or given is None or abs(float(want) - float(given)) <= self.validator.tol:
+                continue
+            parts.append(f"the form's own figures put {what} at Rs {M.number(want)} before {month}, "
+                         f"but Rs {M.number(given)} was entered")
+            cells += [f"weekly.{row}.{wk}" for wk in WEEKS if sub.record.get(f"weekly.{row}.{wk}") is not None][:1]
+        if not parts:
+            return None
+        return Issue(rule="opening_inconsistent", severity=Severity.error, category=Category.continuity,
+                     message="The opening totals don't match the form: " + "; and ".join(parts)
+                             + ". Check the mother book, then enter the totals again.",
+                     fields=["header.shg_name"] + cells)
 
     # ---------------------------------------------------------------- member corrections
     def summary_value(self, rec: FormRecord, key: str) -> Any:
@@ -562,7 +677,7 @@ class Pipeline:
         items = {key: short for key, short in M.SUMMARY_ITEMS}
         for key, v in list(sub.overrides.items()):
             found = self.summary_value(sub.record, key)
-            if self._same(found, v):
+            if self._same(found, v, key):
                 sub.overrides.pop(key)
                 sub.event("member_correction_resolved", label=key, value=v)
                 continue
@@ -578,9 +693,12 @@ class Pipeline:
                                   f"{_show(key, found)}. Check the photo, then {how}.",
                           fields=self.correction_cells(sub.record, key), expected=v, found=found, label=key, **kw))
 
-    def _same(self, a: Any, b: Any) -> bool:
+    def _same(self, a: Any, b: Any, key: Optional[str] = None) -> bool:
+        """Equal as she'd see it: amounts within the rounding tolerance, counts exactly
+        (19 members is not 18)."""
         if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
-            return abs(a - b) <= float(self.t.validation.get("money_tolerance", 1))
+            tol = float(self.t.validation.get("money_tolerance", 1)) if key is None or M.is_money_item(key) else 0
+            return abs(a - b) <= tol
         if isinstance(a, str) and isinstance(b, str):
             return " ".join(a.split()).casefold() == " ".join(b.split()).casefold()
         return a == b
@@ -633,7 +751,7 @@ class Pipeline:
             self._require(sub, EDITABLE, "edit a value")
             if field_id not in sub.record.fields:
                 if field_id not in set(self.t.all_field_ids()):
-                    raise NotFound(f"unknown field {field_id!r}")
+                    raise NotFound(f"There is no cell called “{field_id}” on this form.")
                 sub.record.fields[field_id] = FieldValue()   # a cell the reader left out
             value = self.check_value(field_id, raw)
             fv = sub.record.fields[field_id]
@@ -647,7 +765,7 @@ class Pipeline:
             if changed:
                 self._reopen(sub, officer, f"{short_label(self.t, field_id)} changed")
                 if field_id == "header.shg_name":
-                    sub.new_group = False
+                    self._forget_new_group(sub)
             sub.write_error = None
             if field_id in ("header.shg_name", "header.month_year"):
                 self._lookup_prior(sub)
@@ -655,39 +773,64 @@ class Pipeline:
             self.store.save(sub)
 
     def check_value(self, field_id: str, raw: Any) -> Any:
-        """Normalise an officer's value, refusing anything that can't be a real cell value."""
+        """Normalise an officer's value, refusing anything that can't be a real cell value.
+        Every refusal is a ValueError with a sentence the dashboard can show as it is."""
         if raw is None or (isinstance(raw, str) and not raw.strip()):
             return None
         ftype = self.t.field_type(field_id)
         if isinstance(raw, (list, dict)):
             raise ValueError("Enter a single value.")
-        if ftype in ("money", "int"):
-            if isinstance(raw, bool):
-                raise ValueError("Enter a number.")
-            if isinstance(raw, float) and not math.isfinite(raw):
-                raise ValueError("Enter a real number.")
-            v = normalise(raw, ftype)
-            if v is None:
-                return None
-            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
-                raise ValueError(f"Not a number: {raw!r}")
-            if ftype == "int":
-                if float(v) != int(v):
-                    raise ValueError("Enter a whole number.")
-                v = int(v)
-                if not 0 <= v <= MAX_COUNT:
-                    raise ValueError(f"Enter a number between 0 and {MAX_COUNT:,}.")
-            elif not 0 <= v <= MAX_MONEY:
-                raise ValueError(f"Amounts must be between 0 and {MAX_MONEY:,.0f}.")
-            return v
-        if ftype == "yesno":
-            return normalise(raw, ftype)
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and not math.isfinite(raw):
-            raise ValueError("Enter a real value.")
-        v = normalise(raw, ftype)
-        if isinstance(v, str) and len(v) > MAX_TEXT:
+        if isinstance(raw, str) and len(raw) > MAX_TEXT:
             raise ValueError(f"Keep it under {MAX_TEXT} characters.")
-        return v
+        if isinstance(raw, int) and not isinstance(raw, bool) and abs(raw) > 10 ** 12:
+            raw = float("inf")                        # a 400-digit number: refused below, never a 500
+        shown = _quoted(raw)
+        try:
+            if ftype in ("money", "int"):
+                if isinstance(raw, bool):
+                    raise ValueError("Enter a number.")
+                if isinstance(raw, float) and not math.isfinite(raw):
+                    raise ValueError("That number is too large. Enter the amount as it is written on the form.")
+                try:
+                    v = normalise(raw, ftype)
+                except ValueError:
+                    raise ValueError(f"{shown} isn't a number. Enter it in digits, like 1200.") from None
+                if v is None:
+                    return None
+                if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+                    raise ValueError(f"{shown} isn't a number. Enter it in digits, like 1200.")
+                if ftype == "int":
+                    if float(v) != int(v):
+                        raise ValueError("Enter a whole number.")
+                    v = int(v)
+                    if not 0 <= v <= MAX_COUNT:
+                        raise ValueError(f"Enter a number between 0 and {MAX_COUNT:,}.")
+                elif not 0 <= v <= MAX_MONEY:
+                    raise ValueError(f"Amounts must be between 0 and {MAX_MONEY:,.0f}.")
+                return v
+            if isinstance(raw, float) and not math.isfinite(raw):
+                raise ValueError("Enter a real value.")
+            if ftype == "yesno":
+                try:
+                    return normalise(raw, ftype)
+                except ValueError:
+                    raise ValueError("Choose Yes or No.") from None
+            if ftype == "month":
+                bad = ValueError(f"{shown} isn't a month between 2000 and 2100. Enter it like 10/2026.")
+                try:
+                    v = normalise(raw, ftype)
+                except ValueError:
+                    raise bad from None
+                year = re.search(r"\d{4}", str(raw))         # '0001-01' must not become January 2001
+                if v is not None and year and year[0] != v[:4]:
+                    raise bad
+                return v
+            v = normalise(raw, ftype)
+            if isinstance(v, str) and len(v) > MAX_TEXT:
+                raise ValueError(f"Keep it under {MAX_TEXT} characters.")
+            return v
+        except OverflowError:
+            raise ValueError("That number is too large. Enter the amount as it is written on the form.") from None
 
     def officer_override(self, sub: Submission, label: str, accept: bool, officer: str) -> None:
         """Decide on a member's correction. accept=False keeps the form's figure.
@@ -697,7 +840,7 @@ class Pipeline:
         with lock:
             self._require(sub, EDITABLE, "decide on the member's correction")
             if label not in sub.overrides:
-                raise NotFound(f"no pending member correction for {label!r}")
+                raise NotFound(f"There is no member correction waiting for “{label}”. It may already have been decided.")
             v = sub.overrides[label]
             if accept:
                 cell = self.single_cell(sub.record, label)
@@ -715,7 +858,8 @@ class Pipeline:
                 sub.event("override_accepted", label=label, value=v, cell=cell, by=officer)
                 self._reopen(sub, officer, "member's figure used")
                 if cell in ("header.shg_name", "header.month_year"):
-                    sub.new_group = False
+                    if cell == "header.shg_name":
+                        self._forget_new_group(sub)
                     self._lookup_prior(sub)
             else:
                 sub.overrides.pop(label)
@@ -738,8 +882,11 @@ class Pipeline:
             blocking = [i for i in sub.validation.errors if i.rule not in ignore]
             if blocking and not force:
                 n = len(blocking)
-                raise StateError(f"{n} check{'s' if n != 1 else ''} still failing. Fix them, "
-                                 "or approve anyway with a reason.")
+                raise StateError(f"Can't send it yet: {n} check{'s are' if n != 1 else ' is'} still failing. "
+                                 "Fix them, or use Send anyway with a reason.")
+            stuck = _not_forceable(blocking)
+            if stuck:
+                raise StateError(f"Can't send anyway: {NOT_FORCEABLE[stuck]}")
             sub.forced = {"by": officer, "reason": reason, "at": now()} if force else None
             sub.overwrite = {"by": officer, "reason": reason, "at": now()} if overwrite else None
             sub.write_error = None
@@ -806,33 +953,134 @@ class Pipeline:
             self.conversations.append_bot(sub.sender, reply, sid)
         return reply
 
-    def confirm_new_group(self, sub: Submission, officer: str) -> None:
-        """The SHG name is a new group: unknown_shg stops blocking and the writer may create a tab."""
+    def confirm_new_group(self, sub: Submission, officer: str, started_this_month: bool = False,
+                          opening: Optional[dict[str, Any]] = None) -> None:
+        """The SHG name is a new group: unknown_shg stops blocking and the writer may create a
+        tab. Its opening 'to date' totals (BEFORE this month) are needed for Palmera's column C:
+        zeros when it started this month, else all nine from the mother book. They also give
+        the week-1 checks their 'last month'. Calling it again replaces the totals."""
         with lock:
             self._require(sub, EDITABLE, "confirm a new group")
             name = sub.record.get("header.shg_name")
             if not name:
                 raise StateError("Can't confirm a new group: the SHG name is empty.")
             if sub.shg_tab is not None:
-                raise StateError(f"'{name}' already has a tab in the workbook ({sub.shg_tab}).")
-            sub.new_group = True
-            sub.event("new_group_confirmed", name=name, by=officer)
-            self._reopen(sub, officer, "new group confirmed")
+                raise StateError(f"Can't confirm a new group: “{name}” already has a tab in the workbook "
+                                 f"({sub.shg_tab}).")
+            values = self.check_opening(started_this_month, opening)
+            sub.new_group, sub.opening, sub.started_this_month = True, values, bool(started_this_month)
+            sub.event("new_group_confirmed", name=name, by=officer, started_this_month=bool(started_this_month),
+                      opening=values)
+            sub.member_confirmed, sub.write_error = False, None
+            if sub.status == Status.awaiting_member:
+                sub.status = Status.needs_review
+                sub.event("reopened", by=officer, why="new group confirmed")
+            self._lookup_prior(sub)
             self.revalidate(sub)
             self.store.save(sub)
+
+    def check_opening(self, started_this_month: bool, opening: Optional[dict[str, Any]]) -> dict[str, float]:
+        """The nine opening totals, all present and plausible (ValueError -> HTTP 400)."""
+        if started_this_month:
+            if opening and any(_amount(v) not in (0, None) for v in opening.values()):
+                raise ValueError("Either say the group started this month (its opening totals are then zero), "
+                                 "or enter its opening totals from the mother book, not both.")
+            return {label: 0 for label in OPENING_LABELS}
+        if not opening:
+            raise ValueError("Say whether the group started this month, or enter its nine opening totals "
+                             "from the mother book (0 is allowed).")
+        if not isinstance(opening, dict):
+            raise ValueError("Send the opening totals as a list of totals and amounts.")
+        unknown = [k for k in opening if k not in OPENING_LABELS]
+        if unknown:
+            raise ValueError(f"“{str(unknown[0])[:80]}” isn't one of the nine opening totals.")
+        missing = [k for k in OPENING_LABELS if opening.get(k) in (None, "")]
+        if missing:
+            raise ValueError("Enter all nine opening totals from the mother book (0 is allowed). Missing: "
+                             + ", ".join(k.replace(" (Rs.)", "") for k in missing) + ".")
+        out: dict[str, float] = {}
+        for k in OPENING_LABELS:
+            v = _amount(opening[k])
+            if v is None:
+                raise ValueError(f"{k.replace(' (Rs.)', '')}: {_quoted(opening[k])} isn't an amount. "
+                                 "Enter it in digits, like 52600.")
+            if not 0 <= v <= MAX_MONEY:
+                raise ValueError(f"{k.replace(' (Rs.)', '')}: amounts must be between 0 and {MAX_MONEY:,.0f}.")
+            out[k] = v
+        return out
+
+    def _forget_new_group(self, sub: Submission) -> None:
+        """The group name changed: the new-group decision was about the old name."""
+        if sub.new_group:
+            sub.event("new_group_cleared", why="group name changed")
+        sub.new_group, sub.opening, sub.started_this_month = False, None, None
 
     def actions(self, sub: Submission) -> dict[str, bool]:
         """What the dashboard may offer for this report right now."""
         has = sub.record is not None
+        unknown = has and sub.status in EDITABLE and sub.shg_tab is None and bool(sub.record.get("header.shg_name"))
         return {
             "edit": has and sub.status in EDITABLE,
             "approve": has and sub.status == Status.needs_review,
             "reject": sub.status in OPEN + (Status.failed,),
-            "retry": sub.status == Status.failed,
+            # Try again can't help when offline demo mode simply can't read this photo
+            "retry": sub.status == Status.failed and not (sub.failure_kind in UNKNOWN_SAMPLE_KINDS and self.offline_demo),
             "process_now": sub.status == Status.collecting and 1 in sub.pages and sub.id not in self._busy,
-            "new_group": has and sub.status in EDITABLE and sub.shg_tab is None and not sub.new_group
-                         and bool(sub.record.get("header.shg_name")),
+            "new_group": unknown and not sub.new_group,
+            "opening": unknown and sub.new_group,            # change the new group's opening totals
+            "resend": bool(sub.undelivered()),
         }
+
+    @property
+    def offline_demo(self) -> bool:
+        return hasattr(self.reader, "for_submission")      # the DemoReader
+
+    # ================================================================ delivery
+    def record_delivery(self, sender: str, mid: Optional[str], delivered: Optional[bool],
+                        error: Optional[str] = None, wamid: Optional[str] = None) -> None:
+        """Write a WhatsApp send's result onto the bot message, in her conversation and in
+        the report's log (the same `mid`)."""
+        if not mid:
+            return
+        with lock:
+            conv = self.conversations.load(sender)
+            m = conv.bot_message(mid=mid)
+            sid = m.get("sid") if m else None
+            if m is not None:
+                m.update(delivered=delivered, delivery_error=error, attempted=now())
+                if wamid:
+                    m["wamid"] = wamid
+                self.conversations.save(conv)
+            for s in ([self._load_quiet(sid)] if sid else []):
+                e = s.bot_entry(mid) if s else None
+                if e is not None:
+                    e.update(delivered=delivered, delivery_error=error)
+                    self.store.save(s)
+
+    def record_status(self, recipient: str, wamid: str, error: str) -> bool:
+        """Meta's status callback says a message we sent was NOT delivered."""
+        with lock:
+            m = self.conversations.load(recipient).bot_message(wamid=wamid)
+            if m is None:
+                return False
+            self.record_delivery(recipient, m.get("mid"), False, error, wamid)
+            return True
+
+    def to_resend(self, sub: Submission) -> list[tuple[str, str]]:
+        """[(mid, text)] of her undelivered messages for this report, oldest first: the text
+        as it was meant to go out (with the privacy note, if it carried one)."""
+        conv = self.conversations.load(sub.sender)
+        out = []
+        for e in sub.undelivered():
+            m = conv.bot_message(mid=e.get("mid"))
+            out.append((e.get("mid"), str(m["text"]) if m else str(e.get("text", ""))))
+        return out
+
+    def _load_quiet(self, sid: Optional[str]) -> Optional[Submission]:
+        try:
+            return self.store.load(sid) if sid else None
+        except NotFound:
+            return None
 
     def _send_summary(self, sub: Submission) -> Reply:
         sub.status = Status.awaiting_member
@@ -844,8 +1092,11 @@ class Pipeline:
         """A text from a member. It goes to her NEWEST open report and the answer depends on
         that report's state, always in her language."""
         with lock:
-            sub = self.store.open_for(sender)
             kind, arg = M.parse_member_reply(text)
+            # OK and "5 12000" answer a summary: her newest one waiting for a reply, even if she
+            # has started sending next month's photos since. Anything else: her newest report.
+            sub = (self._summary_for(sender) if kind in ("confirm", "correct") else None) \
+                or self.store.open_for(sender)
             if sub is None:
                 return self._no_open_report(sender, kind, lang)
             sub.log.append({"at": now(), "from": "member", "text": text})
@@ -853,6 +1104,17 @@ class Pipeline:
             if sub.status != Status.written:
                 self.store.save(sub)
             return sub, reply
+
+    def _summary_for(self, sender: str) -> Optional[Submission]:
+        """Her newest report awaiting her OK, unless a newer open report for the same group
+        and month (which will replace it) has arrived since: then her reply goes to that one."""
+        a = self.store.awaiting_for(sender)
+        if a is None:
+            return None
+        key = self._report_key(a)
+        newer = [s for s in self.store.for_sender(sender)
+                 if s.created > a.created and s.status in OPEN and self._report_key(s) == key]
+        return None if newer else a
 
     def _no_open_report(self, sender: str, kind: str, lang: Optional[str]) -> tuple[Optional[Submission], Reply]:
         mine = self.store.for_sender(sender)
@@ -893,7 +1155,7 @@ class Pipeline:
         except ValueError:
             return sub.say(M.msg("not_understood_value", sub.lang, n=n))
         shown = M.per_lang(lambda l: M.display_value(key, value, l))
-        if self._same(current, value):
+        if self._same(current, value, key):
             return sub.say(M.msg("correction_same", sub.lang, n=n, value=shown))
         sub.overrides[key] = value
         sub.status = Status.needs_review
@@ -913,8 +1175,17 @@ class Pipeline:
                 raise ValueError(raw)
             return v
         row = self._monthly_rows[key]
-        integer = row["from"] == "count_yes" or self.t.weekly_row(row["field"]).type == "int"
-        return M.parse_amount(raw, integer=integer)
+        cap = None
+        if row["from"] == "header":                   # e.g. Members: a header cell
+            prefix = "page2" if row["field"] == "members_with_goals" else "header"
+            integer = self.t.field_type(f"{prefix}.{row['field']}") == "int"
+            cap = next((f.max for f in self.t.header if f.key == row["field"]), None)
+        else:
+            integer = row["from"] == "count_yes" or self.t.weekly_row(row["field"]).type == "int"
+        v = M.parse_amount(raw, integer=integer)
+        if integer and v > (cap if cap is not None else MAX_COUNT):
+            raise ValueError(raw)                     # "10 5000" members: ask again, never store it
+        return v
 
     # ================================================================ workbook + receipt
     def write(self, sub: Submission, notify_failure: bool = True) -> Optional[Reply]:
@@ -926,7 +1197,8 @@ class Pipeline:
             self.revalidate(sub)
             ignore = {"write_failed"} | ({"month_already_recorded"} if sub.overwrite else set())
             blocking = [i for i in sub.validation.errors if i.rule not in ignore]
-            if blocking and not sub.forced:
+            stuck = _not_forceable(blocking)
+            if blocking and (not sub.forced or stuck):
                 return self._write_failed(sub, f"Not written: {len(blocking)} check(s) failing "
                                                f"({'; '.join(i.message for i in blocking[:3])}).", notify_failure)
             name = sub.shg_tab or sub.record.get("header.shg_name")
@@ -934,10 +1206,12 @@ class Pipeline:
             if not name or not month:
                 return self._write_failed(sub, "Not written: the SHG name or the month is empty.", notify_failure)
             values = to_monthly(sub.record, self.t)
+            creating = sub.new_group and sub.shg_tab is None
             try:
                 wb = GNWorkbook(self.workbook_path, self.t)
                 rep = wb.write_month(str(name), str(month), values, gn_name=sub.record.get("header.village_gn"),
-                                     overwrite=bool(sub.overwrite), create_tab=sub.new_group)
+                                     overwrite=bool(sub.overwrite), create_tab=creating,
+                                     opening=sub.opening if creating else None)
                 wb.save()
             except PermissionError:
                 return self._write_failed(sub, f"Close {self.workbook_path.name} in Excel and try again.", notify_failure)
@@ -956,7 +1230,9 @@ class Pipeline:
                 sub.lang, month=month, group=rep.sheet,
                 savings=values.get("Savings (Rs.)"), repay=values.get("Principal loan repayments (Rs.)"),
                 cash=values.get("Cash in Hand – at end of month (mother book) (Rs.)"),
-                savings_to_date=_savings_to_date(wb, rep.sheet, str(month))))
+                # a new tab's total is only right when backed by its opening totals
+                savings_to_date=None if rep.created_tab and sub.opening is None
+                else _savings_to_date(wb, rep.sheet, str(month))))
             self.store.save(sub)
             return reply
 
@@ -970,7 +1246,38 @@ class Pipeline:
         return reply
 
 
-PIPELINE_RULES = {"member_correction", "write_failed", "unknown_shg", "prior_lookup_failed", "month_already_recorded"}
+PIPELINE_RULES = {"member_correction", "write_failed", "unknown_shg", "prior_lookup_failed", "month_already_recorded",
+                  "month_out_of_range", "opening_inconsistent"}
+
+
+def _not_forceable(blocking: list[Issue]) -> Optional[str]:
+    """The first failing check "Send anyway" may not skip."""
+    return next((i.rule for i in blocking if i.rule in NOT_FORCEABLE), None)
+
+
+def _amount(v: Any) -> Optional[float]:
+    """An opening total as a number (digits, '52,600', 52600.0), else None."""
+    if isinstance(v, bool):
+        return None
+    try:
+        n = normalise(v, "money")
+    except (ValueError, OverflowError):
+        return None
+    if not isinstance(n, (int, float)) or not math.isfinite(n):
+        return None
+    return n
+
+
+def _quoted(raw: Any) -> str:
+    text = str(raw) if not isinstance(raw, str) else raw
+    return f"“{text[:40]}{'…' if len(text) > 40 else ''}”"
+
+
+def _jpeg(img: np.ndarray) -> bytes:
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    if not ok:
+        raise ValueError("could not encode the photo as JPEG")
+    return buf.tobytes()
 
 
 def _savings_to_date(wb: GNWorkbook, sheet: str, month: str) -> Optional[float]:
@@ -995,9 +1302,17 @@ def _show(key: str, v: Any) -> str:
 def _describe(e: Exception) -> str:
     """A reason an officer can read."""
     text = str(e).strip()
-    if isinstance(e, ExtractionError) or getattr(e, "member_key", None):
-        return text or type(e).__name__
+    if isinstance(e, (ExtractionError, WorkbookError)) or getattr(e, "member_key", None):
+        return text or "The photos could not be read."
     return f"{type(e).__name__}: {text}" if text else type(e).__name__
+
+
+def _reading_failure(e: Exception) -> str:
+    """Why reading the photos failed, for the failed report's card."""
+    if isinstance(e, ExtractionError) or getattr(e, "member_key", None):
+        return _describe(e)
+    return (f"Something went wrong while reading the photos ({_describe(e)[:200]}). Use Try again; "
+            "if it fails again, ask the member for a new photo.")
 
 
 def _mask(sender: str) -> str:

@@ -67,7 +67,7 @@ Worth a native speaker's check, because our WhatsApp summaries reuse these label
 
 **About the workflow**
 7. Should the system write straight into the **live GN Google Sheets** (through a service account) or into a staging copy that an officer copies across?
-8. **New SHGs:** month 1 needs lifetime totals from the mother book (savings, repayments, loans and so on to date). Who provides these when a group is first set up?
+8. **New SHGs:** month 1 needs lifetime totals from the mother book (savings, repayments, loans and so on to date). The app asks the officer for them (or zero, for a group that started this month) and checks them against the form's own savings to date and loans outstanding. Who should provide these when a group is first set up, and is the mother book the right source?
 9. **Who sends the photo and confirms the summary?** The person completing the form, or the cluster representative? We need a list linking phone numbers to SHGs.
 10. Is there a fixed **meeting day** per group? The WhatsApp receipt could then include the next meeting date.
 11. **Data protection** (PDPA No. 9 of 2022): where can photos be stored, for how long, and what consent wording should members see on first use?

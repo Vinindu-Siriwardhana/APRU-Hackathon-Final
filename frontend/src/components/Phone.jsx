@@ -68,11 +68,16 @@ export function PhoneDevice({ phone, docked = false }) {
           )}
         </div>
         <div className="quick" role="group" aria-label="Quick replies">
-          {QUICK.map((q) => (
-            <button key={q.text} onClick={() => phone.send({ text: q.text })} disabled={sending} title={`Sends “${q.text}”`}>
-              {q.label}
-            </button>
-          ))}
+          {QUICK.map((q) => {
+            // OK and "5 12000" only mean something while she has a summary to confirm
+            const live = phone.latest?.status === "awaiting_member";
+            return (
+              <button key={q.text} onClick={() => phone.send({ text: q.text })} disabled={sending || !live}
+                title={live ? `Sends “${q.text}”` : "For when she has a summary to confirm"}>
+                {q.label}
+              </button>
+            );
+          })}
         </div>
         <form
           className="composer"
@@ -103,7 +108,7 @@ function Bubble({ m, lang, showEnglish, onImage }) {
       ) : m.image ? (
         <span className="msg-photo"><Icon name="photo" size={15} /> Photo</span>
       ) : (
-        <span className="msg-text">{m.text}</span>
+        <span className="msg-text" lang={lang && lang !== "en" && (!mine || /[^\x00-\x7F]/.test(m.text || "")) ? lang : "en"}>{m.text}</span>
       )}
       {english && <span className="msg-en" lang="en">{m.text_en}</span>}
       <span className="msg-time">{clock(m.at)}</span>
@@ -112,7 +117,7 @@ function Bubble({ m, lang, showEnglish, onImage }) {
 }
 
 /** The demo's Member's phone screen: the phone, plus the photos a member could send. */
-export default function PhonePage({ phone }) {
+export default function PhonePage({ phone, guide = null }) {
   const [samples, setSamples] = useState([]);
   const stage = useRef(null);
   // on a narrow screen the photos sit below the phone: bring the chat back into view to see the reply
@@ -136,12 +141,14 @@ export default function PhonePage({ phone }) {
       {list.map((s) => {
         const d = describe(s);
         return (
-          <button key={s} role="listitem" className={`thumb ${d.bad ? "is-bad" : ""}`} onClick={() => sendPhoto(s)} disabled={phone.sending}
-            aria-label={`Send photo: ${d.title}${d.sub ? `, ${d.sub}` : ""}`}>
-            <img src={sampleUrl(s)} alt="" loading="lazy" />
-            <span className="thumb-title">{d.title}</span>
-            {d.sub && <span className="thumb-sub">{d.sub}</span>}
-          </button>
+          <div key={s} role="listitem" className="thumb-item">
+            <button className={`thumb ${d.bad ? "is-bad" : ""}`} onClick={() => sendPhoto(s)} disabled={phone.sending}
+              aria-label={`Send photo: ${d.title}${d.sub ? `, ${d.sub}` : ""}`}>
+              <img src={sampleUrl(s)} alt="" loading="lazy" />
+              <span className="thumb-title">{d.title}</span>
+              {d.sub && <span className="thumb-sub">{d.sub}</span>}
+            </button>
+          </div>
         );
       })}
     </div>
@@ -154,8 +161,9 @@ export default function PhonePage({ phone }) {
           <h1 className="pane-title">Member’s phone</h1>
           <p className="pane-sub">What an SHG member sees on WhatsApp: she sends the photos, then confirms the numbers.</p>
         </header>
+        {guide && <div className="side-block side-guide">{guide}</div>}
 
-        <div className="side-block">
+        <div className="side-block side-lang">
           <h2 className="side-heading" id="lang-h">Her language</h2>
           <div className="segmented" role="radiogroup" aria-labelledby="lang-h">
             {Object.entries(LANGS).map(([k, v]) => (

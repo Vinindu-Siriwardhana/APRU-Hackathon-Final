@@ -1,5 +1,5 @@
 import { WORKBOOK_URL } from "../../api.js";
-import { isMoneyLabel, money, monthName, shortMonthly } from "../../format.js";
+import { curly, isMoneyLabel, money, monthName, plural, shortMonthly } from "../../format.js";
 import Icon from "../Icon.jsx";
 
 const lastEvent = (log, test) => [...(log || [])].reverse().find((e) => e.event && test(e.event));
@@ -15,12 +15,12 @@ const ID = /^[0-9a-f]{10}$/;
 const newerId = (e) => e && [e.by_id, e.new_id, e.newer, e.replaced_by, e.superseded_by, e.id, e.by].find((v) => typeof v === "string" && ID.test(v));
 
 /** One clear sentence (or card) saying where this report stands and what happens next. */
-export default function StatusCard({ sub, errors, cleared, onRetry, busy }) {
+export default function StatusCard({ sub, errors, cleared, reading = false }) {
   const log = sub.log;
   const forced = sub.forced || (lastEvent(log, (n) => n === "officer_approved")?.forced ? lastEvent(log, (n) => n === "officer_approved") : null);
   const forcedNote = forced ? (
     <p className="status-note">
-      <Icon name="warn" size={14} /> Sent without every check passing{forced.reason ? `: “${forced.reason}”` : "."}
+      <Icon name="warn" size={14} /> Sent without every check passing{forced.reason ? `: “${curly(forced.reason)}”` : "."}
     </p>
   ) : null;
 
@@ -33,7 +33,7 @@ export default function StatusCard({ sub, errors, cleared, onRetry, busy }) {
         return (
           <div className="statusline tone-red" role="status">
             <span>
-              She confirmed the figures, but the workbook couldn’t be written: {failedWrite.message} Then press <strong>Write to workbook</strong>.
+              She confirmed the figures, but the workbook couldn’t be written: {curly(failedWrite.message)} Then press <strong>Write to workbook</strong>.
             </span>
           </div>
         );
@@ -41,7 +41,7 @@ export default function StatusCard({ sub, errors, cleared, onRetry, busy }) {
         <div className={`statusline tone-${errors.length ? "orange" : "green"}`} role="status">
           <span>
             {errors.length
-              ? `${errors.length === 1 ? "One check needs" : `${errors.length} checks need`} your eye before this goes back to the member.`
+              ? `${errors.length === 1 ? "One check needs" : `${errors.length} checks need`} your eye before this goes to the member.`
               : "Everything checks out. Send it to the member to confirm."}
           </span>
           {cleared && (
@@ -62,14 +62,17 @@ export default function StatusCard({ sub, errors, cleared, onRetry, busy }) {
     case "written":
       return <WrittenCard sub={sub} forcedNote={forcedNote} />;
     case "failed": {
+      // the backend words the failure for an officer; the one action is in the header
       const e = lastEvent(log, (n) => n.includes("fail"));
-      const why = sub.failure || e?.reason || e?.error;
+      const why = curly(sub.failure || e?.reason || e?.error || "");
+      const canRetry = sub.actions ? !!sub.actions.retry : true;
       return (
         <div className="statusline tone-red" role="status">
           <span>
-            The photos couldn’t be read{why ? `: ${why.replace(/\.$/, "")}.` : "."} She’s been told an officer will follow up.
+            {why ? `${why.replace(/\.?$/, ".")} ` : "The photos couldn’t be read. "}
+            She’s been told an officer will follow up.{" "}
+            {canRetry ? "Try again reads the same photos once more." : /new photo/i.test(why) ? "" : "Ask her for a new photo."}
           </span>
-          <button className="btn btn-small btn-primary" onClick={onRetry} disabled={busy}>Try again</button>
         </div>
       );
     }
@@ -98,7 +101,7 @@ export default function StatusCard({ sub, errors, cleared, onRetry, busy }) {
     default:
       return (
         <div className="statusline tone-grey" role="status">
-          <span>{sub.pages?.[1] && !sub.pages?.[2] ? "Page 1 arrived. Waiting for page 2." : sub.pages?.[2] ? "Page 2 arrived. Waiting for page 1." : "Waiting for the member’s photos."}</span>
+          <span>{reading ? "Reading page 1 now. This takes a few seconds." : sub.pages?.[1] && !sub.pages?.[2] ? "Page 1 arrived. Waiting for page 2." : sub.pages?.[2] ? "Page 2 arrived. Waiting for page 1." : "Waiting for the member’s photos."}</span>
         </div>
       );
   }
@@ -110,7 +113,7 @@ function WrittenCard({ sub, forcedNote }) {
   if (!w) {
     return (
       <div className="statusline tone-green" role="status">
-        <span>Confirmed by the member and recorded in Palmera’s workbook.</span>
+        <span>She confirmed the summary, and the month is recorded in Palmera’s workbook.</span>
       </div>
     );
   }
@@ -122,7 +125,8 @@ function WrittenCard({ sub, forcedNote }) {
         <div>
           <h2 className="written-title" id="written-h">Written to Palmera’s workbook</h2>
           <p className="written-sub">
-            Tab {w.sheet}, column {w.column}, {w.writes.length} cells{w.month ? ` for ${monthName(w.month)}` : ""}. The member confirmed every figure.
+            Tab {w.sheet}, column {w.column}, {plural(w.writes.length, "cell")}{w.month ? ` for ${monthName(w.month)}` : ""}.{" "}
+            {sub.forced || forcedNote ? "She confirmed the summary on WhatsApp." : "She confirmed the summary; every other figure passed the ledger checks."}
             {w.created_tab ? " A new tab was made for this group." : ""}
           </p>
         </div>
@@ -139,7 +143,7 @@ function WrittenCard({ sub, forcedNote }) {
           <tbody>
             {w.writes.map((c) => (
               <tr key={c.cell}>
-                <th scope="row">{shortMonthly(c.label)}</th>
+                <th scope="row" className={/^Loan Purpose/.test(c.label) ? "is-sub" : undefined}>{shortMonthly(c.label)}</th>
                 <td className="cell-ref">{String(c.cell).replace(/^.*!/, "")}</td>
                 <td className="muted">{val(c.label, c.old)}</td>
                 <td className="cell-new">{val(c.label, c.new)}</td>
@@ -148,7 +152,7 @@ function WrittenCard({ sub, forcedNote }) {
           </tbody>
         </table>
       </div>
-      {w.warnings?.length > 0 && <ul className="written-warn">{w.warnings.map((t, i) => <li key={i}>{t}</li>)}</ul>}
+      {w.warnings?.length > 0 && <ul className="written-warn">{w.warnings.map((t, i) => <li key={i}>{curly(t)}</li>)}</ul>}
     </section>
   );
 }

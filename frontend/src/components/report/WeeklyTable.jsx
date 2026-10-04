@@ -60,7 +60,7 @@ export default function WeeklyTable({ template, fields, flagged, selected, onSel
                       const cls = [review && flagged[fid] ? "is-flagged" : "", selected === fid ? "is-selected" : "", EDITED.includes(fv?.status) ? "is-edited" : ""].join(" ");
                       return (
                         <td key={c} className={cls}>
-                          <button onClick={() => onSelect(fid, { scroll: true })} aria-pressed={selected === fid}
+                          <button data-fid={fid} onClick={() => onSelect(fid, { scroll: true })} aria-pressed={selected === fid}
                             aria-label={`${SHORT[r.key]}, ${c === "Total" ? "total" : c}: ${display(v, r.type) || "blank"}${review && flagged[fid] ? ", needs a check" : ""}`}>
                             {display(v, r.type)}
                           </button>

@@ -21,20 +21,39 @@ two things for free:
 """
 from __future__ import annotations
 
+import re
 from collections import Counter
 from dataclasses import dataclass, field
-from typing import Iterable, Optional, Union
+from datetime import date
+from typing import Any, Iterable, Optional, Union
 
 from pydantic import BaseModel, Field, PrivateAttr
 
-from .aggregate import last_active_week, monthly_value
-from .models import Category, FieldValue, FormRecord, Issue, Legibility, PriorMonth, Severity
+from .aggregate import _tidy, last_active_week, monthly_value
+from .models import Category, FieldStatus, FieldValue, FormRecord, Issue, Legibility, PriorMonth, Severity
 from .schema import WEEKS, Template
 
 INCOME = ("savings", "principal_repaid", "interest_repaid", "other_income")
 PURPOSES = ("loan_purpose_income", "loan_purpose_emergency", "loan_purpose_other")
 CAPTURE_RULES = {"passes_disagree", "ink_mismatch", "unclear_handwriting", "not_a_number"}
+# An officer looked at the cell on the photo (kept it, or typed a new value).
+CHECKED = (FieldStatus.officer_confirmed, FieldStatus.officer_corrected)
+KEPT = "Checked against the photo, kept as written: "
 Number = Union[int, float]
+
+# The nine "to date" totals Palmera's column C holds for a group's first month (exact
+# workbook labels, as in the YAML's opening_rows).
+SAVINGS_TD = "Total savings to date (Rs.)"
+PRINCIPAL_TD = "Total Principal loan repayments to date (Rs.)"
+INTEREST_TD = "Total Interest repayments to date (Rs.)"
+OTHER_INC_TD = "Total Other income to date (Rs.)"
+LOANS_TD = "Total Loans distributed to date (Rs.)"
+REFUNDED_TD = "Total Savings refunded to date (Rs.)"
+OTHER_EXP_TD = "Total Other expenses to date (Rs.)"
+WRITE_OFF_TD = "Total Loan right off to date (Rs.)"
+OUTSTANDING_TD = "Total Loans outstanding to date (Rs.)"
+OPENING_LABELS = (SAVINGS_TD, PRINCIPAL_TD, INTEREST_TD, OTHER_INC_TD, LOANS_TD, REFUNDED_TD,
+                  OTHER_EXP_TD, WRITE_OFF_TD, OUTSTANDING_TD)
 
 
 class Likely(BaseModel):
@@ -43,6 +62,7 @@ class Likely(BaseModel):
     checks: int                              # blocking issues that list this cell
     suggest: Optional[Number] = None         # a value those issues agree on
     balances: int = 0                        # how many of those issues that value clears
+    also_clears: int = 0                     # warnings (e.g. cash_mismatch) that value clears too
 
 
 class ValidationResult(BaseModel):
@@ -54,6 +74,7 @@ class ValidationResult(BaseModel):
     _support: dict[str, int] = PrivateAttr(default_factory=dict)
     _expense_seen: set[str] = PrivateAttr(default_factory=set)
     _expense_matched: bool = PrivateAttr(default=False)
+    _today: Optional[str] = PrivateAttr(default=None)               # YYYY-MM the checks ran against
 
     @property
     def errors(self) -> list[Issue]:
@@ -93,6 +114,78 @@ def add_months(ym: str, n: int) -> str:
     y, m = map(int, ym.split("-"))
     idx = y * 12 + (m - 1) + n
     return f"{idx // 12:04d}-{idx % 12 + 1:02d}"
+
+
+def _ym(d: date) -> str:
+    return f"{d.year:04d}-{d.month:02d}"
+
+
+def _valid_ym(v: Any) -> Optional[str]:
+    """A normalised YYYY-MM month, else None."""
+    return v if isinstance(v, str) and re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", v) else None
+
+
+# --------------------------------------------------------------------------- opening totals
+def _before(rec: FormRecord, balance: str, flows: dict[str, int], ambiguous: tuple[str, ...],
+            tol: float = 1.0) -> Optional[Number]:
+    """A balance BEFORE the month, from the form: a week's written balance minus the month's
+    flows up to that week. Only weeks with no `ambiguous` flow so far count (a refund or
+    write-off may or may not be in the written balance), and every such week must agree."""
+    seen: list[float] = []
+    run = amb = 0.0
+    for wk in WEEKS:
+        run += sum(sign * rec.num(f"weekly.{k}.{wk}") for k, sign in flows.items())
+        amb += sum(abs(rec.num(f"weekly.{k}.{wk}")) for k in ambiguous)
+        b = rec.number(f"weekly.{balance}.{wk}")
+        if b is None or amb:
+            continue
+        seen.append(b - run)
+    if not seen or max(seen) - min(seen) > tol or seen[0] < 0:
+        return None
+    return _tidy(seen[0])
+
+
+def opening_suggestion(record: FormRecord, template: Any = None) -> dict[str, Optional[Number]]:
+    """The nine opening "to date" totals BEFORE this month, where the form itself says them.
+    Savings to date = a week's savings to date − the month's savings up to that week; loans
+    outstanding likewise (+ distributed − principal − write-offs). Every other total (and any
+    the form can't settle) is None: it has to come from the group's mother book."""
+    out: dict[str, Optional[Number]] = {label: None for label in OPENING_LABELS}
+    out[SAVINGS_TD] = _before(record, "savings_to_date", {"savings": 1}, ("savings_refunded",))
+    out[OUTSTANDING_TD] = _before(record, "loans_outstanding",
+                                  {"loans_distributed": 1, "principal_repaid": -1}, ("write_offs",))
+    return out
+
+
+def implied_opening_cash(opening: Optional[dict[str, Any]]) -> Optional[Number]:
+    """The cash Palmera's formulas imply from the opening totals (its C20 formula without the
+    month's own flows): savings + principal + interest + other income − loans distributed −
+    savings refunded − other expenses, all to date. None when any of those is missing."""
+    if not opening:
+        return None
+    vals = [opening.get(k) for k in (SAVINGS_TD, PRINCIPAL_TD, INTEREST_TD, OTHER_INC_TD,
+                                     LOANS_TD, REFUNDED_TD, OTHER_EXP_TD)]
+    if any(v is None or isinstance(v, bool) or not isinstance(v, (int, float)) for v in vals):
+        return None
+    s, p, i, o, l, r, x = (float(v) for v in vals)
+    return _tidy(s + p + i + o - l - r - x)
+
+
+def prior_from_opening(record: FormRecord, opening: Optional[dict[str, Any]],
+                       started_this_month: bool = False) -> PriorMonth:
+    """The 'last month' a new group's week-1 checks start from: its opening totals (zeros for
+    a group that started this month), with the opening cash Palmera's formulas imply."""
+    op = dict(opening or {})
+    if started_this_month:
+        op = {label: op.get(label) or 0 for label in OPENING_LABELS}
+    try:
+        month = add_months(str(_valid_ym(record.get("header.month_year"))), -1)
+    except ValueError:
+        month = None
+    num = lambda k: float(op[k]) if isinstance(op.get(k), (int, float)) and not isinstance(op.get(k), bool) else None
+    return PriorMonth(month=month, cash_in_hand=implied_opening_cash(op), savings_to_date=num(SAVINGS_TD),
+                      savings_refunded_to_date=num(REFUNDED_TD), loans_outstanding=num(OUTSTANDING_TD),
+                      members=None, source="opening", started_this_month=started_this_month)
 
 
 def _key(issue: Issue) -> tuple[str, str]:
@@ -148,8 +241,9 @@ _BLANK = _Blank()
 
 # --------------------------------------------------------------------------- validator
 class Validator:
-    def __init__(self, template: Template):
+    def __init__(self, template: Template, today: Optional[date] = None):
         self.t = template
+        self.today = today                   # None: the real date (tests pin it)
         v = template.validation
         self.tol = float(v.get("money_tolerance", 1))
         self.expense_variants: list[list[str]] = v.get("total_expenses_variants", [])
@@ -239,12 +333,15 @@ class Validator:
             return False
 
     # ------------------------------------------------------------------ entry
-    def validate(self, rec: FormRecord, prior: Optional[PriorMonth] = None) -> ValidationResult:
-        res = self._check_all(rec, prior)
+    def validate(self, rec: FormRecord, prior: Optional[PriorMonth] = None,
+                 today: Optional[date] = None) -> ValidationResult:
+        res = self._check_all(rec, prior, _ym(today or self.today or date.today()))
         return self.finish(rec, res, prior, _base=res)
 
-    def _check_all(self, rec: FormRecord, prior: Optional[PriorMonth]) -> ValidationResult:
+    def _check_all(self, rec: FormRecord, prior: Optional[PriorMonth],
+                   today: Optional[str] = None) -> ValidationResult:
         res = ValidationResult()
+        res._today = today or _ym(self.today or date.today())
         weeks = self.active_weeks(rec)
         self._capture(rec, res)
         self._required(rec, res)
@@ -256,7 +353,8 @@ class Validator:
             self._income_total(rec, res, col)
             self._expense_total(rec, res, col)
         self._expense_definition(res)
-        self._running_balances(rec, res, weeks, prior)
+        opening_ok = self._opening_consistency(rec, res, prior)
+        self._running_balances(rec, res, weeks, prior if opening_ok else None)
         self._month_end_cash(rec, res)
         self._continuity(rec, res, prior)
         self._findings(rec, res, weeks)
@@ -518,16 +616,20 @@ class Validator:
         last_wk = last_active_week(rec, self.t)
 
         prev_cash: Optional[Lin] = Lin(const=prior.cash_in_hand) if use_prior and prior.cash_in_hand is not None else None
-        cash_src = "last month's closing cash"
         prev_sav: list[Lin] = []
         if use_prior and prior.savings_to_date is not None:
             prev_sav = [Lin(const=prior.savings_to_date)]
             if prior.savings_refunded_to_date:      # a group may keep savings to date net of refunds
                 prev_sav.append(Lin(const=prior.savings_to_date - prior.savings_refunded_to_date))
-        sav_src = "last month's savings to date"
         sav_net = False
         prev_out: Optional[Lin] = Lin(const=prior.loans_outstanding) if use_prior and prior.loans_outstanding is not None else None
-        out_src = "last month's loans outstanding"
+        if prior is not None and prior.source == "opening":
+            whose = "new group" if prior.started_this_month else "mother book"
+            cash_src = f"opening cash ({'new group' if prior.started_this_month else 'from the mother-book totals'})"
+            sav_src, out_src = f"opening savings to date ({whose})", f"opening loans outstanding ({whose})"
+        else:
+            cash_src, sav_src = "last month's closing cash", "last month's savings to date"
+            out_src = "last month's loans outstanding"
 
         for wk in weeks:
             inc = Lin.cells(self.w(k, wk) for k in INCOME)
@@ -549,13 +651,21 @@ class Validator:
 
             # Actual cash vs expected: usually a real shortfall or surplus for the group (a finding).
             # In the month's last week it is the cash written to the workbook, so it must be looked at.
+            wo_lin = Lin.cells([self.w("write_offs", wk)])
             if expected_written is not None:
                 refs = [Lin.cells([exp_id])]
+                if "write_offs" in variants[0]:
+                    # This week's Total Expenses counts write-offs, so Expected Balance is short by
+                    # them, but a write-off is not cash leaving the box: cash = expected + write-offs.
+                    refs.append(Lin.cells([exp_id]) + wo_lin)
             elif prev_cash is not None:
                 refs = [prev_cash + inc - e for e in exps]
             else:
                 refs = []
-            if cash is not None and refs and not any(self.eq(cash, r.value(rec)) for r in refs):
+            if cash is not None and refs and any(self.eq(cash, r.value(rec)) for r in refs):
+                for f in _unique([cash_id] + next(r for r in refs if self.eq(cash, r.value(rec))).fields):
+                    res._support[f] = res._support.get(f, 0) + 1      # cash agrees: evidence both were read right
+            elif cash is not None and refs:
                 ref = refs[0].value(rec)
                 diff = cash - ref
                 how = f"{_rs(abs(diff))} {'more' if diff > 0 else 'less'} than"
@@ -593,7 +703,6 @@ class Validator:
             out = rec.number(out_id)
             d_lin = Lin.cells([self.w("loans_distributed", wk)])
             p_lin = Lin.cells([self.w("principal_repaid", wk)])
-            wo_lin = Lin.cells([self.w("write_offs", wk)])
             if out is not None and prev_out is not None:
                 calc = (prev_out + d_lin - p_lin - wo_lin).value(rec)
                 self._ledger(rec, res, "loans_outstanding",
@@ -613,16 +722,28 @@ class Validator:
 
             # Carry forward to next week. A blank cell must not break the chain: use the
             # written expected balance, else work it out from this week's entries.
+            # A write-off is not cash leaving the box: when this week's Expected Balance counts
+            # it as an expense, the cash is that balance PLUS the write-offs.
             if cash is not None:
                 prev_cash, cash_src = Lin.cells([cash_id]), "last week's cash in hand"
             elif expected_written is not None:
-                prev_cash, cash_src = Lin.cells([exp_id]), "last week's expected balance"
+                prev_cash = Lin.cells([exp_id]) + (wo_lin if "write_offs" in variants[0] else Lin())
+                cash_src = "last week's expected balance"
             elif prev_cash is not None:
-                prev_cash, cash_src = prev_cash + inc - exps[0], "last week's balance (worked out from its entries)"
+                cash_exp = next((e for v, e in zip(variants, exps) if "write_offs" not in v), exps[0])
+                prev_cash, cash_src = prev_cash + inc - cash_exp, "last week's balance (worked out from its entries)"
             if sav is not None:
                 prev_sav, sav_src = [Lin.cells([sav_id])], "last week's savings to date"
             elif prev_sav:
-                prev_sav = [prev_sav[0] + s_lin - (r_lin if sav_net else Lin())]
+                # Blank this week: carry EVERY variant on (gross, and net of this week's refund),
+                # the one the group is known to use first.
+                carried = [p + s_lin for p in prev_sav] + [p + s_lin - r_lin for p in prev_sav]
+                if sav_net:
+                    carried = [p + s_lin - r_lin for p in prev_sav] + [p + s_lin for p in prev_sav]
+                uniq: dict[float, Lin] = {}
+                for c in carried:
+                    uniq.setdefault(round(c.value(rec), 2), c)
+                prev_sav = list(uniq.values())
                 sav_src = "last week's savings to date (worked out)"
             if out is not None:
                 prev_out, out_src = Lin.cells([out_id]), "last week's loans outstanding"
@@ -648,17 +769,65 @@ class Validator:
                           fields=[cash_id]))
 
     # ------------------------------------------------------------------ layer 3
+    def _checked(self, rec: FormRecord, fid: str) -> bool:
+        fv = rec.fields.get(fid)
+        return fv is not None and fv.status in CHECKED
+
+    def _opening_consistency(self, rec: FormRecord, res: ValidationResult, prior: Optional[PriorMonth]) -> bool:
+        """A new group the officer says started this month: its opening totals are zero, so the
+        form's own savings to date and loans outstanding must be just this month's flows. When
+        they are clearly MORE (in the first and the last week that has them), the group is
+        older: block, and don't run the week-1 checks from zero (they would suggest 'fixing'
+        correctly read cells)."""
+        if not (prior and prior.started_this_month and self._prior_is_last_month(rec, prior)):
+            return True
+        ok = True
+        checks = [
+            ("savings_to_date", {"savings": 1}, "savings_refunded", prior.savings_to_date,
+             "The form says total savings to date is {v}, but the group's only savings this month is {c}, "
+             "so it did not start this month. Enter its totals from the mother book."),
+            ("loans_outstanding", {"loans_distributed": 1, "principal_repaid": -1}, "write_offs", prior.loans_outstanding,
+             "The form says total loans outstanding is {v}, but this month's loans less repayments come to only "
+             "{c}, so the group did not start this month. Enter its totals from the mother book."),
+        ]
+        for bal, flows, alt, base, text in checks:
+            base = base or 0.0
+            run = alt_run = 0.0
+            written: list[tuple[str, float, float, float]] = []      # week, figure, gross, net
+            for wk in WEEKS:
+                run += sum(sign * rec.num(self.w(k, wk)) for k, sign in flows.items())
+                alt_run += rec.num(self.w(alt, wk))
+                v = rec.number(self.w(bal, wk))
+                if v is not None:
+                    written.append((wk, v, base + run, base + run - alt_run))
+            if not written:
+                continue
+            above = lambda e: e[1] > max(e[2], e[3]) + self.tol
+            first, last = written[0], written[-1]
+            if above(first) and above(last):
+                ok = False
+                res.add(Issue(rule="opening_inconsistent", severity=Severity.error, category=Category.continuity,
+                              message=text.format(v=_rs(last[1]), c=_rs(last[2])),
+                              fields=[self.w(bal, e[0]) for e in written], expected=last[2], found=last[1]))
+        return ok
+
     def _continuity(self, rec: FormRecord, res: ValidationResult, prior: Optional[PriorMonth]) -> None:
-        if not prior:
-            return
         month = rec.get("header.month_year")
-        if month and prior.this_month_recorded:
+        ym = _valid_ym(month)
+        m_checked = self._checked(rec, "header.month_year")
+        unexpected = False
+        if ym and ym < "2000-01":
+            unexpected = True
+            res.add(Issue(rule="month_unexpected", severity=Severity.error, category=Category.continuity,
+                          message=f"The form says {_month_name(ym)}, which is before 2000. Check the month on the photo.",
+                          fields=["header.month_year"], found=month))
+        elif prior and month and prior.this_month_recorded:
             res.add(Issue(rule="month_already_recorded", severity=Severity.error, category=Category.continuity,
                           message=f"{_month_name(month)} is already recorded in the workbook for this group. "
                                   "Check the month on the form. If this report corrects that month, "
                                   "an officer has to confirm the correction.",
                           fields=["header.month_year"], found=month))
-        elif month and prior.month:
+        elif prior and month and prior.month:
             try:
                 nxt = add_months(prior.month, 1)
             except ValueError:
@@ -669,18 +838,47 @@ class Validator:
                                       f"{_month_name(month)} is not a new month. Is this a correction, or the wrong month?",
                               fields=["header.month_year"], expected=nxt, found=month))
             elif nxt and month != nxt:
-                last_missing = add_months(str(month), -1)
-                gap = _month_name(nxt) if last_missing == nxt else f"{_month_name(nxt)} to {_month_name(last_missing)}"
-                res.add(Issue(rule="month_gap", severity=Severity.warning, category=Category.continuity,
-                              message=f"The last month recorded is {_month_name(prior.month)}, so {gap} "
-                                      f"{'is' if last_missing == nxt else 'are'} missing. Last month's closing "
-                                      "balances were not used for the week 1 checks.",
-                              fields=["header.month_year"], expected=nxt, found=month))
+                # More than one month after the last recorded month: usually a misread month or
+                # year (10/2027 for 10/2026), which would put the figures in the wrong column.
+                # An officer must look; once she has, it is the usual missing-months warning.
+                unexpected = True
+                if m_checked:
+                    last_missing = add_months(str(month), -1)
+                    gap = _month_name(nxt) if last_missing == nxt else f"{_month_name(nxt)} to {_month_name(last_missing)}"
+                    res.add(Issue(rule="month_gap", severity=Severity.warning, category=Category.continuity,
+                                  message=f"The last month recorded is {_month_name(prior.month)}, so {gap} "
+                                          f"{'is' if last_missing == nxt else 'are'} missing. Last month's closing "
+                                          "balances were not used for the week 1 checks.",
+                                  fields=["header.month_year"], expected=nxt, found=month))
+                else:
+                    res.add(Issue(rule="month_unexpected", severity=Severity.error, category=Category.continuity,
+                                  message=f"The form says {_month_name(month)}, but the last month recorded for this "
+                                          f"group is {_month_name(prior.month)}. Check the month on the photo. If months "
+                                          "really are missing, confirm it as written.",
+                                  fields=["header.month_year"], expected=nxt, found=month))
+        today = res._today
+        if ym and today and not unexpected and ym > add_months(today, 1):
+            text = (f"The form says {_month_name(ym)}, but that is more than a month from now "
+                    f"({_month_name(today)}). Check the month on the photo. If it is right, confirm it as written.")
+            res.add(Issue(rule="month_unexpected", severity=Severity.warning if m_checked else Severity.error,
+                          category=Category.continuity, message=(KEPT + text) if m_checked else text,
+                          fields=["header.month_year"], expected=f"<= {add_months(today, 1)}", found=month))
+
         members = rec.number("header.total_members")
-        if members is not None and prior.members is not None and abs(members - prior.members) > 5:
-            res.add(Issue(rule="members_jump", severity=Severity.warning, category=Category.continuity,
-                          message=f"Members changed from {prior.members} last month to {members:g}.",
-                          fields=["header.total_members"], expected=prior.members, found=members))
+        if prior and members is not None and prior.members is not None and abs(members - prior.members) > 5:
+            change = f"Members changed from {prior.members} last month to {members:g}."
+            if abs(members - prior.members) > 0.25 * prior.members:
+                # A big jump is more often a misread (18 read as 48) than a real change, and the
+                # member count is not in her WhatsApp summary: an officer has to look.
+                checked = self._checked(rec, "header.total_members")
+                res.add(Issue(rule="members_jump", severity=Severity.warning if checked else Severity.error,
+                              category=Category.continuity,
+                              message=KEPT + change if checked else
+                              change + " Check the member count on the photo. If it really changed, confirm it as written.",
+                              fields=["header.total_members"], expected=prior.members, found=members))
+            else:
+                res.add(Issue(rule="members_jump", severity=Severity.warning, category=Category.continuity,
+                              message=change, fields=["header.total_members"], expected=prior.members, found=members))
 
     # ------------------------------------------------------------------ layer 5
     def _findings(self, rec: FormRecord, res: ValidationResult, weeks: list[str]) -> None:
@@ -728,7 +926,8 @@ class Validator:
             "history": [h for h in old.history if h.get("event") != "capture_check"]})
         return FormRecord.model_construct(template_id=rec.template_id, fields=fields, image_ids=rec.image_ids)
 
-    def _pass_choice(self, rec: FormRecord, fid: str, prior: Optional[PriorMonth]) -> Optional[Number]:
+    def _pass_choice(self, rec: FormRecord, fid: str, prior: Optional[PriorMonth],
+                     res_today: Optional[str] = None) -> Optional[Number]:
         """Readings disagree: the reading the ledger supports, if exactly one does better."""
         passes = rec.fields[fid].passes
         if any(isinstance(p, bool) or not isinstance(p, (int, float, type(None))) for p in passes):
@@ -736,7 +935,7 @@ class Validator:
         cands = list(dict.fromkeys(passes))  # a blank reading competes too, but is never suggested
         scored = []
         for v in cands:
-            after = self._check_all(self._substitute(rec, fid, v), prior)
+            after = self._check_all(self._substitute(rec, fid, v), prior, res_today)
             wrong = sum(1 for i in after.errors if fid in i.fields and i.rule not in CAPTURE_RULES)
             scored.append((wrong, -after._support.get(fid, 0), v))
         scored.sort(key=lambda x: (x[0], x[1]))
@@ -752,7 +951,8 @@ class Validator:
         errors = res.errors
         if not errors:
             return []
-        base = base or self._check_all(rec, prior)   # unchanged record: which issues the validator owns
+        today = res._today or (base._today if base else None)
+        base = base or self._check_all(rec, prior, today)   # unchanged record: which issues the validator owns
         base_keys = {_key(i) for i in base.issues}
         # capture issues get their suggestion here (it needs the whole ledger)
         for issue in errors:
@@ -760,7 +960,7 @@ class Validator:
             if fid not in rec.fields or issue.suggest:
                 continue
             if issue.rule == "passes_disagree":
-                v = self._pass_choice(rec, fid, prior)
+                v = self._pass_choice(rec, fid, prior, today)
             elif issue.rule in ("unclear_handwriting", "ink_mismatch") and base._support.get(fid):
                 v = rec.number(fid)          # unclear, but the sums it is part of balance
                 v = int(v) if v is not None and v.is_integer() else v
@@ -778,18 +978,25 @@ class Validator:
                 (val, n), *rest = cands.most_common()
                 if (n >= 2 and (not rest or rest[0][1] < n)) or (len(its) == 1 and n == 1):
                     suggest = val
-            balances = 0
+            balances = also = 0
             if suggest is not None:
-                after = self._check_all(self._substitute(rec, f, suggest), prior)
+                after = self._check_all(self._substitute(rec, f, suggest), prior, today)
                 after_keys = {_key(i) for i in after.issues if i.severity == Severity.error}
+                after_all = {_key(i) for i in after.issues}
                 before = {_key(i) for i in res.issues}
                 new = [i for i in after.errors if f in i.fields and _key(i) not in base_keys | before]
                 balances = sum(1 for i in its if _key(i) in base_keys and _key(i) not in after_keys)
+                # Tie-break: a warning that lists this cell (e.g. W1 "cash in hand is Rs 60,000
+                # more than expected") and goes away too is evidence this is the misread cell.
+                also = sum(1 for i in base.issues if i.severity == Severity.warning and f in i.fields
+                           and _key(i) not in after_all)
                 if new or balances == 0:
-                    suggest, balances = None, 0     # it would break another check, or clear nothing
-            out.append(Likely(field=f, checks=len(its), suggest=suggest, balances=balances))
+                    suggest, balances, also = None, 0, 0   # it would break another check, or clear nothing
+            out.append(Likely(field=f, checks=len(its), suggest=suggest, balances=balances, also_clears=also))
 
         capture = {f for i in errors if i.rule in CAPTURE_RULES for f in i.fields}
-        out.sort(key=lambda l: (-l.checks, l.suggest is None, -l.balances, l.field not in capture,
-                                self._order.get(l.field, len(self._order))))
+        # Last tie-breaks: a cell other balanced sums already vouch for is less likely the misread
+        # one; then form order.
+        out.sort(key=lambda l: (-l.checks, l.suggest is None, -l.balances, -l.also_clears, l.field not in capture,
+                                base._support.get(l.field, 0), self._order.get(l.field, len(self._order))))
         return out

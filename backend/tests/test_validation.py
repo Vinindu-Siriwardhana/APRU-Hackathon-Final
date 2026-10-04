@@ -1,6 +1,6 @@
 import pytest
 
-from app.models import Legibility, PriorMonth, normalise, normalise_month
+from app.models import FieldStatus, Legibility, PriorMonth, normalise, normalise_month
 from app.sample_data import make_month
 from app.schema import load_template
 from app.validation import Validator
@@ -99,7 +99,11 @@ def test_attendance_checks():
 
 def test_duplicate_month_and_gap():
     assert "month_already_recorded" in rules(V.validate(make_month(T, month="2026-09"), PRIOR))
-    assert "month_gap" in rules(V.validate(make_month(T, month="2026-11"), PRIOR))
+    # round 2: a skipped month blocks (month_unexpected) until an officer confirms the month
+    assert "month_unexpected" in rules(V.validate(make_month(T, month="2026-11"), PRIOR))
+    rec = make_month(T, month="2026-11")
+    rec.fields["header.month_year"].status = FieldStatus.officer_confirmed
+    assert "month_gap" in rules(V.validate(rec, PRIOR))
 
 
 def test_required_header():

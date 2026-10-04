@@ -62,13 +62,14 @@ export default function Inbox({ filter, selectedId, subs, loaded, template, noti
                     <span className="row-main">
                       <span className="row-title">{s.shg || "New report"}</span>
                       <span className="row-sub">
-                        {s.month ? monthName(s.month) : s.pages?.length ? `Page ${s.pages.join(" and ")} received` : "Waiting for photos"}
+                        {s.month ? monthName(s.month) : s.pages?.length ? `Page ${s.pages.join(" and ")} received` : "No usable photo yet"}
                         {s.gn ? `, ${s.gn}` : ""}
                       </span>
                       <span className="row-meta">
                         <span className={`tag tone-${st.tone}`}>
                           {s.status === "needs_review" && s.errors ? `${s.errors} to check` : st.label}
                         </span>
+                        {s.undelivered > 0 && <span className="tag tone-red"><Icon name="warn" size={11} stroke={2.4} /> Not delivered</span>}
                         <span className="row-time">{relTime(s.created)}</span>
                       </span>
                     </span>
@@ -84,7 +85,7 @@ export default function Inbox({ filter, selectedId, subs, loaded, template, noti
         {selectedId ? (
           <ReportDetail key={selectedId} id={selectedId} filter={filter} template={template} notify={notify} refresh={refresh} />
         ) : (
-          <div className="empty empty-detail">
+          <div className="empty empty-detail is-idle">
             <Icon name="photo" size={40} stroke={1.2} />
             <h2>Select a report</h2>
             <p>You’ll see the photo, every figure read from it, and anything that needs your check.</p>

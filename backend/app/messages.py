@@ -59,6 +59,9 @@ SUMMARY_ITEMS = [
     ("Interest repayment (Rs.)", "Interest"),
     ("Loans distributed (Rs.)", "Loans given"),
     ("Cash in Hand – at end of month (mother book) (Rs.)", "Cash in hand (month end)"),
+    # Item 10, not 3: the member count is written to the workbook and a misread one skews
+    # every attendance rate. It goes last so "5 12000" (savings) keeps its number.
+    ("Number of SHG members", "Members"),
 ]
 
 HEADER_LABELS = {"header.shg_name": {"si": "කණ්ඩායම", "ta": "குழு"},
@@ -247,20 +250,25 @@ REJECT_REASONS: dict[str, dict[str, str]] = {
 # --------------------------------------------------------------------------- replies
 class Reply(str):
     """A bot message: the text in the member's language, plus `.en`, the same message in
-    English (None when the member's language is English)."""
+    English (None when the member's language is English). `.mid` is the message id shared by
+    the submission log and the conversation log once it is recorded, so the WhatsApp
+    delivery result can be written back to both."""
     en: Optional[str]
+    mid: Optional[str] = None
 
-    def __new__(cls, text: str, en: Optional[str] = None):
+    def __new__(cls, text: str, en: Optional[str] = None, mid: Optional[str] = None):
         obj = super().__new__(cls, text)
         obj.en = en
+        obj.mid = mid
         return obj
 
     def then(self, other: "Reply") -> "Reply":
-        """This message followed by another one in the same bubble."""
+        """This message followed by another one in the same bubble (one message, one id)."""
         en = None
-        if self.en or other.en:
-            en = f"{self.en or str(self)}\n\n{other.en or str(other)}"
-        return Reply(f"{self}\n\n{other}", en)
+        other_en = getattr(other, "en", None)
+        if self.en or other_en:
+            en = f"{self.en or str(self)}\n\n{other_en or str(other)}"
+        return Reply(f"{self}\n\n{other}", en, self.mid or getattr(other, "mid", None))
 
 
 def _lang(lang: Optional[str]) -> str:
@@ -354,6 +362,17 @@ def _summary_text(items: list[tuple[str, str, Any]], lang: str) -> str:
         lines.append(f"{i}. {_label(key, short, lang)}: {display_value(key, v, lang)}")
     lines += ["", t("summary_ask", lang)]
     return "\n".join(lines)
+
+
+def summary_items(rec: FormRecord, tpl: Template, lang: str) -> list[dict[str, Any]]:
+    """The numbered items of her WhatsApp summary, for the dashboard (what she confirms).
+    `monthly_label` is the workbook row the item is (None for the group name and month)."""
+    lang = _lang(lang)
+    monthly = {r["label"] for r in tpl.workbook["monthly_rows"]}
+    return [{"n": i, "key": key, "label_en": _label(key, short, "en"), "label": _label(key, short, lang),
+             "value": v, "display": display_value(key, v, lang), "display_en": display_value(key, v, "en"),
+             "monthly_label": key if key in monthly else None}
+            for i, (key, short, v) in enumerate(summary_values(rec, tpl), 1)]
 
 
 def member_summary(rec: FormRecord, tpl: Template, lang: str) -> Reply:

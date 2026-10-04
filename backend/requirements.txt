@@ -1,6 +1,8 @@
 # Bounded below the next major version, so a release on the morning of the demo can't
-# break the install, while Python 3.10-3.13 on Windows, macOS and Linux all still get
-# ready-made wheels (no compiler needed). Tested set: requirements.lock.txt.
+# break the install, while Python 3.10-3.14 on Windows, macOS and Linux all still get
+# ready-made wheels (no compiler needed; checked 2026-10-04 with pip's --only-binary=:all:
+# for win_amd64, macosx_11_0_arm64 and manylinux x86_64). Python 3.15 does NOT yet: PyYAML
+# has no wheel for it, so run.bat / run.sh refuse it. Tested set: requirements.lock.txt.
 fastapi>=0.110,<1
 uvicorn>=0.29,<1
 python-multipart>=0.0.9,<1

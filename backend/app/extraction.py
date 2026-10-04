@@ -29,6 +29,9 @@ from .schema import WEEKS, Template
 DEFAULT_MODEL = os.environ.get("SHG_EXTRACTION_MODEL", "claude-opus-5-5")
 LEGIBILITY = ["clear", "unclear", "illegible", "blank"]
 MAX_TOKENS = 16000          # a full page 1 is ~6k tokens of JSON; stays under the SDK's non-streaming limit
+# Per request. The SDK default is 10 minutes, and a report takes four sequential requests:
+# a hung call would keep "Try again" out of the officer's reach for far too long.
+READ_TIMEOUT = float(os.environ.get("SHG_READ_TIMEOUT", "120"))
 
 
 class ExtractionError(Exception):
@@ -125,9 +128,11 @@ def _jpeg_b64(img: np.ndarray, max_side: int = 1800) -> str:
 
 
 class ClaudeReader:
-    def __init__(self, model: str = DEFAULT_MODEL, client: Any = None):
+    def __init__(self, model: str = DEFAULT_MODEL, client: Any = None, timeout: float = READ_TIMEOUT):
         import anthropic
-        self.client = client or anthropic.Anthropic()
+        self.timeout = timeout
+        # one retry: two tries of `timeout` at most per request
+        self.client = client or anthropic.Anthropic(timeout=timeout, max_retries=1)
         self.model = model
 
     def read(self, images: list[np.ndarray], prompt: str, schema: dict) -> dict:
@@ -139,8 +144,12 @@ class ClaudeReader:
                 model=self.model, max_tokens=MAX_TOKENS,
                 messages=[{"role": "user", "content": content}],
                 output_config={"format": {"type": "json_schema", "schema": schema}},
+                timeout=self.timeout,
             )
         except Exception as e:                      # anthropic.APIError and friends, network errors
+            if "Timeout" in type(e).__name__:
+                raise ExtractionError(f"The reading service did not answer within {self.timeout:g} seconds. "
+                                      "Try again in a few minutes.") from e
             raise ExtractionError(f"The reading service could not be reached ({type(e).__name__}: {e}).") from e
         stop = getattr(resp, "stop_reason", None)
         if stop == "refusal":

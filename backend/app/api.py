@@ -10,7 +10,10 @@ Environment
                           OFFLINE DEMO mode and only recognises the synthetic sample photos
   SHG_DISABLE_SIMULATOR=1 turn off /api/sim/* (do this in production)
   SHG_ALLOW_RESET=1       allow /api/demo/reset outside offline demo mode
-  WHATSAPP_*              see whatsapp.py
+  WHATSAPP_*              see whatsapp.py (with WHATSAPP_TOKEN set, the webhook refuses unsigned
+                          posts unless WHATSAPP_APP_SECRET is set, or WHATSAPP_ALLOW_UNSIGNED=1)
+
+Every 4xx answer is {"detail": "<a sentence an officer can read>"}: the dashboard shows it as it is.
 
 Privacy: there is no login. The server must stay bound to 127.0.0.1 (the default);
 data/ holds phone numbers, chats and photos in plain files.
@@ -24,6 +27,7 @@ import os
 import re
 import shutil
 import sys
+import threading
 import uuid
 from pathlib import Path
 from typing import Any, Optional
@@ -31,9 +35,10 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.concurrency import run_in_threadpool
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from . import messages as M
 from . import whatsapp
@@ -44,6 +49,7 @@ from .labels import short_label
 from .locking import lock, replace
 from .pipeline import NotFound, Pipeline, StateError, Status, Store, Submission
 from .schema import load_template
+from .validation import OPENING_LABELS, opening_suggestion
 from .workbook import GNWorkbook, WorkbookError
 
 log = logging.getLogger("shg.api")
@@ -142,6 +148,25 @@ class Officer(BaseModel):
     officer: str = "officer"
 
 
+class NewGroup(BaseModel):
+    officer: str = "officer"
+    started_this_month: bool = False
+    opening: Optional[dict[str, Any]] = None       # the nine "to date" totals BEFORE this month
+
+
+# Default HTTP reasons, as sentences for the dashboard's toasts.
+PLAIN = {
+    400: "The request could not be understood.",
+    401: "This request isn't signed by WhatsApp.",
+    403: "That isn't allowed on this server.",
+    404: "That page or report doesn't exist. It may have been cleared by Restart demo.",
+    405: "That action isn't available at this address.",
+    409: "That can't be done in the report's current state.",
+    413: "The upload is too large.",
+    422: "Some of the request's values are missing or of the wrong kind.",
+}
+
+
 def _officer(name: str) -> str:
     name = " ".join(str(name or "").split())[:60]
     return name or "officer"
@@ -197,7 +222,19 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
 
     @app.exception_handler(NotFound)
     def _not_found(request: Request, e: NotFound):
-        return JSONResponse({"detail": str(e)}, status_code=404)
+        return JSONResponse({"detail": _sentence(str(e))}, status_code=404)
+
+    @app.exception_handler(StarletteHTTPException)
+    def _http_error(request: Request, e: StarletteHTTPException):
+        detail = e.detail if isinstance(e.detail, str) and e.detail and e.detail != _reason(e.status_code) \
+            else PLAIN.get(e.status_code, "The request could not be completed.")
+        return JSONResponse({"detail": detail}, status_code=e.status_code, headers=getattr(e, "headers", None))
+
+    @app.exception_handler(RequestValidationError)
+    def _bad_request(request: Request, e: RequestValidationError):
+        where = sorted({".".join(str(x) for x in err.get("loc", ())[1:]) or "body" for err in e.errors()})
+        return JSONResponse({"detail": f"{PLAIN[422][:-1]}: {', '.join(where)[:200]}.",
+                             "errors": json.loads(json.dumps(e.errors(), default=str))[:10]}, status_code=422)
 
     # ------------------------------------------------------------ helpers
     def load(sid: str) -> Submission:
@@ -216,6 +253,13 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
             d["validation"].setdefault("likely", [])
         d["corrections"] = pipeline.corrections(s)
         d["actions"] = pipeline.actions(s)
+        # exactly the numbered items of her WhatsApp summary (what she confirms with OK)
+        d["summary_items"] = M.summary_items(r, T, s.lang) if r else []
+        # a group with no tab: the opening totals the form itself implies, for the new-group form
+        d["opening_suggestion"] = (opening_suggestion(r, T) if r and s.shg_tab is None and
+                                   r.get("header.shg_name") and s.status in (Status.needs_review,
+                                                                              Status.awaiting_member) else None)
+        d["undelivered"] = len(s.undelivered())
         return d
 
     def summary_row(s: Submission) -> dict:
@@ -233,31 +277,49 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
             "failure": s.failure if s.status == Status.failed else None,
             "write_error": s.write_error, "corrections": len(s.overrides),
             "rejected_reason": s.rejected_reason if s.status == Status.rejected else None,
+            "failure_kind": s.failure_kind if s.status == Status.failed else None,
+            "undelivered": len(s.undelivered()),
         }
 
+    def send(sender: str, text: str) -> dict:
+        """One WhatsApp send. Never raises."""
+        if not whatsapp.configured():
+            return {"delivered": False, "delivery_error": "Not sent: WhatsApp isn't set up on this server "
+                                                          "(WHATSAPP_TOKEN and WHATSAPP_PHONE_ID)."}
+        try:
+            res = whatsapp.send_text(sender, text)
+            return {"delivered": True, "channel": "whatsapp", "wamid": whatsapp.sent_id(res)}
+        except Exception as e:
+            log.warning("WhatsApp send failed: %s", e)
+            return {"delivered": False, "delivery_error": whatsapp.describe_send_error(e)}
+
     def deliver(sender: str, reply: Optional[str]) -> dict:
-        """Send a bot message to a real member over WhatsApp. Never raises: the state change
-        is already saved, so a failed send is reported, not retried by the client."""
+        """Send a bot message to a real member over WhatsApp and record the result on the
+        message (conversation + report log). Never raises: the state change is already saved,
+        so a failed send is shown to the officer (Resend), not retried by the client."""
         if reply is None:
             return {"delivered": False}
         if sender.startswith("sim:"):
             return {"delivered": True, "channel": "simulator"}
-        if not whatsapp.configured():
-            return {"delivered": False, "delivery_error": "WhatsApp is not configured (WHATSAPP_TOKEN, WHATSAPP_PHONE_ID)."}
+        res = send(sender, str(reply))
         try:
-            whatsapp.send_text(sender, str(reply))
-            return {"delivered": True, "channel": "whatsapp"}
-        except Exception as e:
-            log.warning("WhatsApp send failed: %s", e)
-            return {"delivered": False, "delivery_error": f"WhatsApp send failed: {e}"}
+            pipeline.record_delivery(sender, getattr(reply, "mid", None), res["delivered"],
+                                     res.get("delivery_error"), res.pop("wamid", None))
+        except Exception:                                # the record is a nicety; never fail the action
+            log.exception("could not record a delivery result")
+        res.pop("wamid", None)
+        return res
 
     def action_result(sid: str, reply: Optional[str]) -> dict:
-        """The officer action's result; the WhatsApp send happens outside the lock."""
+        """The officer action's result. The WhatsApp send happens outside the lock, before
+        the view is built, so the view shows whether it was delivered."""
         with lock:
-            s = load(sid)
-            v = view(s)
+            sender = load(sid).sender
+        sent = deliver(sender, reply)
+        with lock:
+            v = view(load(sid))
         return {"reply": None if reply is None else str(reply), "reply_en": getattr(reply, "en", None),
-                **deliver(s.sender, reply), "submission": v}
+                **sent, "submission": v}
 
     def handle_image(sender: str, data: bytes, lang: Optional[str], filename: Optional[str] = None):
         try:
@@ -271,24 +333,31 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
 
     def sim_enabled() -> None:
         if os.environ.get("SHG_DISABLE_SIMULATOR") == "1":
-            raise HTTPException(404, "the simulator is disabled")
+            raise HTTPException(404, "The phone simulator is turned off on this server.")
 
     def sim_sender(sender: str) -> str:
         sender = (sender or "").strip()
         sender = sender if sender.startswith("sim:") else f"sim:{sender}"
         if not SENDER_RE.fullmatch(sender):
-            raise HTTPException(400, "sender must be 1-44 letters, digits or _.:+-")
+            raise HTTPException(400, "The phone name must be 1 to 44 letters or digits (also _ . : + -).")
         return sender
 
     # ------------------------------------------------------------ dashboard
+    # Trivial GETs are async: they never wait for the thread pool, so a burst of photo
+    # uploads can't stall them.
     @app.get("/api/status")
-    def status() -> dict:
+    async def status() -> dict:
+        state = whatsapp.webhook_state()
         return {"mode": "offline-demo" if offline else "claude", "workbook": str(wb_path), "template": T.id,
                 "whatsapp": whatsapp.configured(), "webhook_signed": whatsapp.signature_required(),
+                "webhook": state,
+                "webhook_warning": whatsapp.UNSIGNED_REFUSED if state == "refused" else
+                ("Incoming WhatsApp posts are not checked (no WHATSAPP_APP_SECRET). Local testing only."
+                 if state == "unsigned" and whatsapp.configured() else None),
                 "simulator": os.environ.get("SHG_DISABLE_SIMULATOR") != "1"}
 
     @app.get("/api/template")
-    def template() -> dict:
+    async def template() -> dict:
         """Form structure for the dashboard: table rows, shaded cells, how months are built."""
         return {
             "id": T.id,
@@ -300,10 +369,11 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
                        "columns": [c["key"] for c in f.columns], "max_rows": f.max_rows} for f in T.page2],
             "monthly": T.workbook["monthly_rows"],
             "summary_items": [{"item": i, "label": k, "short": s} for i, (k, s) in enumerate(M.SUMMARY_ITEMS, 1)],
+            "opening_rows": list(OPENING_LABELS),
         }
 
     @app.get("/api/reject-reasons")
-    def reject_reasons() -> list[dict]:
+    async def reject_reasons() -> list[dict]:
         return [{"code": c, "en": v["en"] or "Other (no reason given to the member)"} for c, v in M.REJECT_REASONS.items()]
 
     @app.get("/api/submissions")
@@ -318,20 +388,26 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
 
     @app.get("/api/submissions/{sid}/crops/{field_id}")
     def crop(sid: str, field_id: str):
+        gone = "There is no close-up of this cell (it may have been cleared by Restart demo)."
         if not FIELD_RE.fullmatch(field_id) or ".." in field_id:
-            raise HTTPException(404)
-        p = pipeline.store.dir(sid) / "crops" / f"{field_id}.jpg"
-        if not p.is_file():
-            raise HTTPException(404)
-        return Response(p.read_bytes(), media_type="image/jpeg")
+            raise HTTPException(404, gone)
+        try:
+            return Response((pipeline.store.dir(sid) / "crops" / f"{field_id}.jpg").read_bytes(),
+                            media_type="image/jpeg")
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            raise HTTPException(404, gone) from None
 
     @app.get("/api/submissions/{sid}/pages/{page}")
     def page_image(sid: str, page: int):
+        gone = f"There is no photo of page {page} for this report (it may have been cleared by Restart demo)."
         with lock:
             name = load(sid).pages.get(page)
         if not name:
-            raise HTTPException(404)
-        return Response((pipeline.store.dir(sid) / name).read_bytes(), media_type="image/jpeg")
+            raise HTTPException(404, gone)
+        try:
+            return Response((pipeline.store.dir(sid) / name).read_bytes(), media_type="image/jpeg")
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            raise HTTPException(404, gone) from None
 
     @app.post("/api/submissions/{sid}/fields/{field_id}")
     def set_field(sid: str, field_id: str, body: FieldUpdate) -> dict:
@@ -339,7 +415,7 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
             s = load(sid)
             try:
                 pipeline.officer_set(s, field_id, body.value, _officer(body.officer))
-            except ValueError as e:
+            except (ValueError, OverflowError) as e:
                 raise HTTPException(400, str(e))
             return view(s)
 
@@ -378,11 +454,53 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
         return action_result(sid, reply)
 
     @app.post("/api/submissions/{sid}/new-group")
-    def new_group(sid: str, body: Optional[Officer] = None) -> dict:
+    def new_group(sid: str, body: Optional[NewGroup] = None) -> dict:
+        """{officer, started_this_month, opening}: the group is new. Either it started this
+        month (opening totals zero) or `opening` holds all nine "to date" totals BEFORE this
+        month, from the mother book (labels as in GET /api/template `opening_rows`)."""
+        body = body or NewGroup()
         with lock:
             s = load(sid)
-            pipeline.confirm_new_group(s, _officer(body.officer if body else ""))
+            try:
+                pipeline.confirm_new_group(s, _officer(body.officer), body.started_this_month, body.opening)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
             return view(s)
+
+    resending: set[str] = set()
+    resend_mu = threading.Lock()
+
+    @app.post("/api/submissions/{sid}/resend")
+    def resend(sid: str, body: Optional[Officer] = None) -> dict:
+        """Send her undelivered messages for this report again, oldest first. Stops at the
+        first one WhatsApp still refuses, so she never gets them out of order."""
+        with lock:
+            s = load(sid)
+            todo = pipeline.to_resend(s)
+        with resend_mu:
+            if sid in resending:
+                raise HTTPException(409, "These messages are being sent again right now. Wait a moment.")
+            resending.add(sid)
+        try:
+            resent, error = 0, None
+            for i, (mid, text) in enumerate(todo):
+                res = send(s.sender, text)
+                pipeline.record_delivery(s.sender, mid, res["delivered"], res.get("delivery_error"), res.get("wamid"))
+                if not res["delivered"]:
+                    error = res.get("delivery_error")
+                    break
+                resent += 1
+            with lock:
+                s = load(sid)
+                if todo:
+                    s.event("resent", by=_officer(body.officer if body else ""), resent=resent,
+                            failed=len(todo) - resent)
+                    pipeline.store.save(s)
+                v = view(s)
+        finally:
+            with resend_mu:
+                resending.discard(sid)
+        return {"resent": resent, "failed": len(todo) - resent, "delivery_error": error, "submission": v}
 
     @app.get("/api/shg-tabs")
     def shg_tabs() -> list[str]:
@@ -418,7 +536,7 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
         """Start the demo over: re-seed the workbook FIRST (atomically), then empty the
         inbox, the conversations and the language choices."""
         if not (offline or os.environ.get("SHG_ALLOW_RESET") == "1"):
-            raise HTTPException(403, "reset is only available in demo mode")
+            raise HTTPException(403, "Restart demo is only available in offline demo mode.")
         with lock:
             try:
                 seed_workbook(wb_path)
@@ -455,7 +573,7 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
         sim_enabled()
         sender = sim_sender(sender)
         if lang is not None and lang not in M.LANGS:
-            raise HTTPException(400, "lang must be en, si or ta")
+            raise HTTPException(400, "The language must be en (English), si (Sinhala) or ta (Tamil).")
         if image is not None:
             data_ = image.file.read(MAX_UPLOAD + 1)
             if not data_:
@@ -464,11 +582,11 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
         elif text and text.strip():
             sub, reply = pipeline.on_text(sender, text, lang=lang)
         else:
-            raise HTTPException(400, "send text or image")
+            raise HTTPException(400, "Send a text message or a photo.")
         if sub is not None:
             with lock:
                 sub = load(sub.id)
-        return {"reply": str(reply), "reply_en": getattr(reply, "en", None),
+        return {"reply": None if reply is None else str(reply), "reply_en": getattr(reply, "en", None),
                 "submission_id": sub.id if sub else None, "status": sub.status if sub else None}
 
     @app.get("/api/sim/conversation")
@@ -490,7 +608,7 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
     def sample(name: str):
         sim_enabled()
         if name not in samples.names():           # only the listed files: no paths
-            raise HTTPException(404)
+            raise HTTPException(404, "There is no sample photo with that name.")
         return FileResponse(SYN / name, media_type="image/jpeg")
 
     # ------------------------------------------------------------ real WhatsApp webhook
@@ -498,11 +616,12 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
     def wa_verify(request: Request):
         challenge = whatsapp.verify(dict(request.query_params))
         if challenge is None:
-            raise HTTPException(403)
+            raise HTTPException(403, "The webhook verify token doesn't match (or WHATSAPP_VERIFY_TOKEN isn't set).")
         return PlainTextResponse(challenge)
 
     def wa_process(m: dict) -> None:
         sender = m["sender"]
+        reply = None
         try:
             if m["type"] == "image":
                 try:
@@ -518,25 +637,49 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
                 _, reply = pipeline.on_other(sender, m.get("kind") or "unsupported")
         except Exception:
             log.exception("WhatsApp message failed")
-            reply = M.msg("error_fallback", pipeline.conversations.load(sender).lang)
-        deliver(sender, reply)
+            try:
+                reply = M.msg("error_fallback", pipeline.conversations.load(sender).lang)
+            except Exception:
+                reply = M.msg("error_fallback", "en")
+        try:
+            deliver(sender, reply)
+        finally:
+            seen.done(m.get("id"))                  # processed (or failed for good): remember it
+
+    def wa_statuses(statuses: list[dict]) -> None:
+        for st in statuses:
+            try:
+                if st["status"] == "failed" and not pipeline.record_status(st["recipient"], st["wamid"], st["error"]):
+                    log.info("WhatsApp reports a failed send for a message we don't know")
+            except Exception:
+                log.exception("could not record a WhatsApp status")
 
     @app.post("/webhook/whatsapp")
     async def wa_incoming(request: Request, background: BackgroundTasks):
+        if whatsapp.webhook_state() == "refused":
+            log.error("Refused a WhatsApp webhook post. %s", whatsapp.UNSIGNED_REFUSED)
+            return JSONResponse({"ok": False, "detail": whatsapp.UNSIGNED_REFUSED}, status_code=503)
         body = await request.body()
         if not whatsapp.signature_ok(body, request.headers.get("X-Hub-Signature-256")):
-            raise HTTPException(401, "bad or missing X-Hub-Signature-256")
+            raise HTTPException(401, "This request isn't signed by WhatsApp (bad or missing X-Hub-Signature-256).")
         try:
             payload = json.loads(body)
         except ValueError:
-            return JSONResponse({"ok": False, "detail": "body is not JSON"}, status_code=400)
-        msgs = whatsapp.parse_incoming(payload)
-        fresh = []
-        for m in msgs:                              # Meta re-delivers; handle each message once
-            if await run_in_threadpool(seen.first_time, m.get("id")):
-                fresh.append(m)
+            return JSONResponse({"ok": False, "detail": "The request body is not valid JSON."}, status_code=400)
+        except RecursionError:
+            return JSONResponse({"ok": False, "detail": "The request body is nested too deeply."}, status_code=400)
+        try:
+            msgs, statuses = whatsapp.parse_incoming(payload), whatsapp.parse_statuses(payload)
+        except RecursionError:
+            return JSONResponse({"ok": False, "detail": "The request body is nested too deeply."}, status_code=400)
+        if msgs and seen.busy():                    # too much queued: Meta retries later
+            log.warning("WhatsApp webhook busy: %d messages refused for now", len(msgs))
+            return JSONResponse({"ok": False, "detail": "Busy. Please retry."}, status_code=503)
+        fresh = [m for m in msgs if seen.claim(m.get("id"))]   # in memory: never waits for the pool
         for m in fresh:
             background.add_task(wa_process, m)      # answer Meta fast; do the work after
+        if statuses:
+            background.add_task(wa_statuses, statuses)
         return {"ok": True, "received": len(msgs), "duplicates": len(msgs) - len(fresh)}
 
     # ------------------------------------------------------------ the dashboard (built React app)
@@ -547,13 +690,13 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
     @app.get("/{path:path}", include_in_schema=False)
     def spa(path: str):
         if path.startswith(("api/", "webhook/", "docs", "openapi")):
-            raise HTTPException(404)
+            raise HTTPException(404, "There is no such address in the API.")
         root = DIST.resolve()
         if path:
             try:
                 f = (DIST / path).resolve()
             except (OSError, ValueError):
-                raise HTTPException(404)
+                raise HTTPException(404, "There is no such page.")
             if f.is_relative_to(root) and f.is_file():   # never anything outside frontend/dist
                 return FileResponse(f)
         index = DIST / "index.html"
@@ -562,6 +705,21 @@ def create_app(data_dir: Path | str | None = None, workbook: Path | str | None =
         return FileResponse(index)
 
     return app
+
+
+def _reason(code: int) -> str:
+    from http import HTTPStatus
+    try:
+        return HTTPStatus(code).phrase
+    except ValueError:
+        return ""
+
+
+def _sentence(text: str) -> str:
+    """'no such submission' -> 'This report doesn't exist…' (NotFound reasons as sentences)."""
+    if text == "no such submission":
+        return "This report doesn't exist. It may have been cleared by Restart demo."
+    return text
 
 
 app = create_app()

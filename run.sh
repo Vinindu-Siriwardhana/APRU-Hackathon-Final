@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # SHG Reports - Mac / Linux launcher:   bash run.sh
-# First run installs everything into the .venv folder (a few minutes, about 100 MB
+# First run installs everything into the .venv folder (a few minutes, about 70-90 MB
 # download - do it the day before, on a good connection). Ctrl+C stops the app.
+# Works with Python 3.10 to 3.14; Python 3.13 is the one to install.
 
 cd "$(dirname "$0")" || exit 1
 
@@ -12,27 +13,41 @@ fail() {                      # print a friendly message and stop
   exit 1
 }
 
-# --- find Python 3.10 or newer ------------------------------------------------------
-is_ok_python() {
+# --- find Python 3.10-3.14, 3.13 first (every library has a ready-made wheel for it) ----
+INSTALL_URL="https://www.python.org/downloads/release/python-31316/"
+usable() {
   # On a Mac without the developer tools, /usr/bin/python3 only opens an installer: skip it.
   if [ "$(uname)" = "Darwin" ] && [ "$(command -v "$1")" = "/usr/bin/python3" ] \
      && ! xcode-select -p >/dev/null 2>&1; then
-    return 1
+    return 2
   fi
-  "$1" -c 'import sys; raise SystemExit(0 if sys.version_info >= (3, 10) else 1)' >/dev/null 2>&1
+  # 0: usable; 3: too new (3.15+: some libraries have no ready-made wheel for it yet,
+  # so pip would need a compiler); anything else: too old or not a working Python.
+  "$1" -c 'import sys; v = sys.version_info[:2]; raise SystemExit(0 if (3, 10) <= v < (3, 15) else 3 if v >= (3, 15) else 1)' >/dev/null 2>&1
 }
-PY=""
-for candidate in python3.13 python3.12 python3.11 python3.10 python3 python; do
-  if command -v "$candidate" >/dev/null 2>&1 && is_ok_python "$candidate"; then
-    PY="$candidate"; break
-  fi
+PY=""; TOO_NEW=""
+for candidate in python3.13 python3.12 python3.11 python3.14 python3.10 python3 python; do
+  command -v "$candidate" >/dev/null 2>&1 || continue
+  usable "$candidate"; status=$?
+  if [ "$status" -eq 0 ]; then PY="$candidate"; break; fi
+  if [ "$status" -eq 3 ] && [ -z "$TOO_NEW" ]; then TOO_NEW="$candidate"; fi
 done
-[ -n "$PY" ] || fail "Python 3.10 or newer was not found." \
-  "Install Python 3.12 from https://www.python.org/downloads/ and run:  bash run.sh"
+if [ -z "$PY" ] && [ -n "$TOO_NEW" ]; then
+  fail "The only Python on this computer is too new for SHG Reports: $("$TOO_NEW" --version 2>&1)." \
+       "Some of the libraries it needs have no ready-made version for it yet." \
+       "Install Python 3.13 as well (you can keep the newer one):" \
+       "  Mac: the macOS installer on $INSTALL_URL" \
+       "  Linux: your package manager's python3.13 (with its venv package), or pyenv" \
+       "then run:  bash run.sh   (it finds python3.13 by itself)."
+fi
+[ -n "$PY" ] || fail "Python 3.10 to 3.14 was not found." \
+  "Install Python 3.13 (Mac: the macOS installer on $INSTALL_URL;" \
+  "Linux: your package manager's python3.13) and run:  bash run.sh"
 
 # --- create the environment (again, if a previous attempt was left half-made) ---------
-if [ -d .venv ] && ! .venv/bin/python -c 'import sys' >/dev/null 2>&1; then
-  echo "Removing a half-made .venv folder..."
+# (also one made with a Python this app can't use, e.g. 3.15 before this check existed)
+if [ -d .venv ] && ! .venv/bin/python -c 'import sys; raise SystemExit(0 if (3, 10) <= sys.version_info[:2] < (3, 15) else 1)' >/dev/null 2>&1; then
+  echo "Removing a half-made or unusable .venv folder..."
   rm -rf .venv
 fi
 if [ ! -d .venv ]; then
@@ -57,10 +72,10 @@ fingerprint() {
 }
 if [ "$(cat .venv/installed.txt 2>/dev/null)" != "$(fingerprint)" ]; then
   echo
-  echo "Installing libraries. This takes a few minutes the first time..."
+  echo "Installing libraries (about 70-90 MB). This takes a few minutes the first time..."
   echo
   .venv/bin/python -m pip install --disable-pip-version-check -q --upgrade pip
-  if ! .venv/bin/python -m pip install --disable-pip-version-check -r backend/requirements.txt; then
+  if ! .venv/bin/python -m pip install --disable-pip-version-check --prefer-binary -r backend/requirements.txt; then
     fail "Installing the libraries failed - see the messages above." \
          "Check your internet connection and run:  bash run.sh" \
          "If it still fails, delete the .venv folder and try once more."

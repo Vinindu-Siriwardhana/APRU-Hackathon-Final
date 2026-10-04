@@ -115,7 +115,7 @@ def test_status_template_tabs_reasons(client):
     c = client
     st = c.get("/api/status").json()
     assert st["mode"] == "offline-demo" and st["simulator"] and not st["whatsapp"]
-    assert len(c.get("/api/template").json()["summary_items"]) == 9
+    assert len(c.get("/api/template").json()["summary_items"]) == 10   # + Members (round 2)
     assert c.get("/api/shg-tabs").json() == ["Kalaimagal", "Vasantham", "Sisila"]
     assert {r["code"] for r in c.get("/api/reject-reasons").json()} >= {"unclear", "missing_page", "other"}
     assert c.get("/api/groups").status_code == 200
@@ -186,7 +186,7 @@ def test_reject_retry_process_now(client):
     r = send(c, "u", "kalaimagal_2026-10_p2.jpg").json()
     assert r["status"] == "failed" and r["reply"] == M.t("demo_unknown_photo", "en")
     row = next(x for x in c.get("/api/submissions").json() if x["id"] == r["submission_id"])
-    assert row["failure"] and "sample photos" in row["failure"]
+    assert row["failure"] and "demo samples" in row["failure"]
     rr = c.post(f"/api/submissions/{r['submission_id']}/retry", json={}).json()
     assert rr["submission"]["status"] == "failed" and rr["reply"] is None      # no second message to her
 
